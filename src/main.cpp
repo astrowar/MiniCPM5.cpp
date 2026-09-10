@@ -508,129 +508,157 @@ public:
     }
 
     // Pipeline principal de execução (Forward Pass) do MiniCPM5
-    std::vector<float> forward(int token_id, int pos, int max_seq_len) {
-        // 1. TOKEN EMBEDDING LOOKUP
-        std::vector<float> x(MODEL_DIM); 
+    const std::vector<float>& forward(int token_id, int pos, int max_seq_len) {
+        // Garante que os buffers tenham o tamanho correto (reallocs ocorrem apenas na primeira chamada)
+        if (x_.size() != MODEL_DIM) x_.resize(MODEL_DIM);
+        if (x_norm_.size() != MODEL_DIM) x_norm_.resize(MODEL_DIM);
+        if (q_.size() != MODEL_DIM) q_.resize(MODEL_DIM);
         
-        // Lookup (Extraindo os 2048 valores da matriz token_embd em Q4_K)
-        get_embedding(x, weights_.token_embd, token_id);
+        int kv_len = MODEL_KV_HEADS * (MODEL_DIM / MODEL_HEADS);
+        if (k_.size() != kv_len) k_.resize(kv_len);
+        if (v_.size() != kv_len) v_.resize(kv_len);
+        
+        if (attn_out_temp_.size() != MODEL_DIM) attn_out_temp_.resize(MODEL_DIM);
+        if (attn_output_.size() != MODEL_DIM) attn_output_.resize(MODEL_DIM);
+        if (gate_.size() != MODEL_FFN_DIM) gate_.resize(MODEL_FFN_DIM);
+        if (up_.size() != MODEL_FFN_DIM) up_.resize(MODEL_FFN_DIM);
+        if (ffn_intermediate_.size() != MODEL_FFN_DIM) ffn_intermediate_.resize(MODEL_FFN_DIM);
+        if (ffn_output_.size() != MODEL_DIM) ffn_output_.resize(MODEL_DIM);
+        if (residual_.size() != MODEL_DIM) residual_.resize(MODEL_DIM);
 
-        // Vetores de buffers temporários reutilizados para evitar alocações dinâmicas na inferência
-        std::vector<float> x_norm(MODEL_DIM);
-        std::vector<float> q(MODEL_HEADS * (MODEL_DIM / MODEL_HEADS)); // Query (2048)
-        std::vector<float> k(MODEL_KV_HEADS * (MODEL_DIM / MODEL_HEADS)); // Key (256)
-        std::vector<float> v(MODEL_KV_HEADS * (MODEL_DIM / MODEL_HEADS)); // Value (256)
-        std::vector<float> attn_out_temp(MODEL_DIM);
-        std::vector<float> attn_output(MODEL_DIM);
-        std::vector<float> gate(MODEL_FFN_DIM);
-        std::vector<float> up(MODEL_FFN_DIM);
-        std::vector<float> ffn_intermediate(MODEL_FFN_DIM);
-        std::vector<float> ffn_output(MODEL_DIM);
+        // 1. TOKEN EMBEDDING LOOKUP
+        // Lookup (Extraindo os 2048 valores da matriz token_embd em Q4_K)
+        get_embedding(x_, weights_.token_embd, token_id);
 
         // 2. ITERAÇÃO DE CAMADAS TRANSFORME (42 CAMADAS)
         for (int l = 0; l < MODEL_LAYERS; l++) {
             const LayerWeights& layer = weights_.layers[l];
             
             // --- BLOCO DE ATENÇÃO (GQA + RoPE) ---
-            std::vector<float> residual = x; // Salva resíduo da Atenção
+            residual_ = x_; // Salva resíduo da Atenção (Sem alocação heap!)
 
             // RMSNorm antes da atenção
-            rmsnorm(x_norm, x, layer.attn_norm);
+            rmsnorm(x_norm_, x_, layer.attn_norm);
 
             // Projeções Q, K, V
-            matmul(q, x_norm, layer.attn_q);
-            matmul(k, x_norm, layer.attn_k);
-            matmul(v, x_norm, layer.attn_v);
+            matmul(q_, x_norm_, layer.attn_q);
+            matmul(k_, x_norm_, layer.attn_k);
+            matmul(v_, x_norm_, layer.attn_v);
 
             // Aplica os embeddings rotacionais RoPE
             int head_dim = MODEL_DIM / MODEL_HEADS;
             for (int h = 0; h < MODEL_HEADS; h++) {
-                apply_rope(q, pos, h, head_dim, MODEL_ROPE_BASE);
+                apply_rope(q_, pos, h, head_dim, MODEL_ROPE_BASE);
             }
             for (int h = 0; h < MODEL_KV_HEADS; h++) {
-                apply_rope(k, pos, h, head_dim, MODEL_ROPE_BASE);
+                apply_rope(k_, pos, h, head_dim, MODEL_ROPE_BASE);
             }
 
             // Atenção GQA com KV Cache
-            execute_attention(attn_out_temp, q, k, v, kv_caches_[l], pos, max_seq_len, MODEL_HEADS, MODEL_KV_HEADS, head_dim);
+            execute_attention(attn_out_temp_, q_, k_, v_, kv_caches_[l], pos, max_seq_len, MODEL_HEADS, MODEL_KV_HEADS, head_dim);
 
             // Projeção de saída da atenção
-            matmul(attn_output, attn_out_temp, layer.attn_output);
+            matmul(attn_output_, attn_out_temp_, layer.attn_output);
 
             // Conexão Residual da Atenção
             #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
-                x[i] = residual[i] + attn_output[i];
+                x_[i] = residual_[i] + attn_output_[i];
             }
 
             // --- BLOCO FEED-FORWARD (SwiGLU) ---
-            residual = x; // Salva resíduo da FFN
+            residual_ = x_; // Salva resíduo da FFN (Sem alocação heap!)
 
             // RMSNorm antes da FFN
-            rmsnorm(x_norm, x, layer.ffn_norm);
+            rmsnorm(x_norm_, x_, layer.ffn_norm);
 
             // Projeções Gate e Up do SwiGLU
-            matmul(gate, x_norm, layer.ffn_gate);
-            matmul(up, x_norm, layer.ffn_up);
+            matmul(gate_, x_norm_, layer.ffn_gate);
+            matmul(up_, x_norm_, layer.ffn_up);
 
             // Ativação SwiGLU: silu(gate) * up
             #pragma omp parallel for
             for (int i = 0; i < MODEL_FFN_DIM; i++) {
-                ffn_intermediate[i] = silu(gate[i]) * up[i];
+                ffn_intermediate_[i] = silu(gate_[i]) * up_[i];
             }
 
             // Down projection
-            matmul(ffn_output, ffn_intermediate, layer.ffn_down);
+            matmul(ffn_output_, ffn_intermediate_, layer.ffn_down);
 
             // Conexão Residual da FFN
             #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
-                x[i] = residual[i] + ffn_output[i];
+                x_[i] = residual_[i] + ffn_output_[i];
             }
         }
 
         // 3. FINAL NORMALIZATION
-        rmsnorm(x_norm, x, weights_.output_norm);
+        rmsnorm(x_norm_, x_, weights_.output_norm);
 
         // 4. LANGUAGE MODEL HEAD (LM HEAD) PROJECTION
-        std::vector<float> logits;
-        matmul(logits, x_norm, weights_.output);
+        matmul(logits_, x_norm_, weights_.output);
 
-        return logits;
+        return logits_;
     }
 
 private:
     std::unique_ptr<std::vector<char>> raw_gguf_buffer_; // Buffer RAM unificado contendo o GGUF
     ModelWeights weights_;
     std::vector<KVCacheLayer> kv_caches_; // Histórico de chaves/valores de cada camada
+
+    // Cached buffers for zero-allocation inference
+    std::vector<float> x_;
+    std::vector<float> x_norm_;
+    std::vector<float> q_;
+    std::vector<float> k_;
+    std::vector<float> v_;
+    std::vector<float> attn_out_temp_;
+    std::vector<float> attn_output_;
+    std::vector<float> gate_;
+    std::vector<float> up_;
+    std::vector<float> ffn_intermediate_;
+    std::vector<float> ffn_output_;
+    std::vector<float> residual_;
+    std::vector<float> logits_;
 };
 
 // ============================================================================
 // 4. SAMPLER ESTOCÁSTICO (Top-p & Temperature)
 // ============================================================================
 
-int sample_token(std::vector<float>& logits, float temperature = 1.0f, float top_p = 0.95f) {
+int sample_token(const std::vector<float>& logits, float temperature = 1.0f, float top_p = 0.95f) {
     int vocab_size = logits.size();
 
-    // 1. Aplica Temperatura (T > 0)
-    if (temperature != 1.0f && temperature > 0.0f) {
-        for (int i = 0; i < vocab_size; i++) {
-            logits[i] /= temperature;
-        }
-    }
+    float inv_temp = (temperature > 0.0f) ? (1.0f / temperature) : 1.0f;
+    bool apply_temp = (temperature != 1.0f && temperature > 0.0f);
 
     // 2. Softmax seguro (usando o max_logit para evitar explosão de Float NaN)
     float max_logit = -1e9f;
-    for (int i = 0; i < vocab_size; i++) {
-        if (logits[i] > max_logit) max_logit = logits[i];
+    if (apply_temp) {
+        for (int i = 0; i < vocab_size; i++) {
+            float val = logits[i] * inv_temp;
+            if (val > max_logit) max_logit = val;
+        }
+    } else {
+        for (int i = 0; i < vocab_size; i++) {
+            if (logits[i] > max_logit) max_logit = logits[i];
+        }
     }
 
     std::vector<std::pair<float, int>> probs(vocab_size);
     float sum_exp = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        float p = std::exp(logits[i] - max_logit);
-        probs[i] = {p, i};
-        sum_exp += p;
+    if (apply_temp) {
+        for (int i = 0; i < vocab_size; i++) {
+            float p = std::exp((logits[i] * inv_temp) - max_logit);
+            probs[i] = {p, i};
+            sum_exp += p;
+        }
+    } else {
+        for (int i = 0; i < vocab_size; i++) {
+            float p = std::exp(logits[i] - max_logit);
+            probs[i] = {p, i};
+            sum_exp += p;
+        }
     }
 
     for (int i = 0; i < vocab_size; i++) {
@@ -807,7 +835,7 @@ int main(int argc, char** argv) {
     auto t_start_prompt = std::chrono::high_resolution_clock::now();
     for (size_t pos = 0; pos < prompt_tokens.size(); ++pos) {
         int token_id = prompt_tokens[pos];
-        std::vector<float> logits = engine.forward(token_id, pos, context_size);
+        const std::vector<float>& logits = engine.forward(token_id, pos, context_size);
 
         // No último token do prompt, sampleamos o primeiro token gerado
         if (pos == prompt_tokens.size() - 1) {
@@ -833,7 +861,7 @@ int main(int argc, char** argv) {
     if (verbose) std::cout << "\n[Inference] Starting autoregressive generation (max " << max_gen_tokens << " tokens)..." << std::endl;
     auto t_start_gen = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < max_gen_tokens && !stop_after_prompt; step++) {
-        std::vector<float> logits = engine.forward(next_token, current_pos, context_size);
+        const std::vector<float>& logits = engine.forward(next_token, current_pos, context_size);
 
         next_token = sample_token(logits, 1.0f, 0.95f);
         current_pos++;
@@ -868,5 +896,6 @@ int main(int argc, char** argv) {
     } else {
         std::cout << std::endl;
     }
+
     return 0;
 }

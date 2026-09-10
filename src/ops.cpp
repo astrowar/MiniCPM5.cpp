@@ -1,69 +1,9 @@
 #include "ops.h"
+#include "ops_internal.h"
 #include <cmath>
 #include <iostream>
 #include <cassert>
 #include <omp.h>
-
-// ============================================================================
-// 1. UTILITÁRIOS MATEMÁTICOS & ESTRUTURAS FÍSICAS DOS BLOCOS
-// ============================================================================
-
-typedef uint16_t ggml_fp16_t;
-
-// Conversor portátil de Half-Float (16-bits) para Float padrão (32-bits)
-static inline float fp16_to_fp32(ggml_fp16_t h) {
-    union { uint32_t u; float f; } o;
-    uint32_t sign = (h & 0x8000) << 16;
-    uint32_t exp  = (h & 0x7C00) >> 10;
-    uint32_t mant = (h & 0x03FF) << 13;
-    if (exp == 0x1F) {
-        o.u = sign | 0x7F800000 | mant;
-    } else if (exp == 0) {
-        if (mant == 0) o.u = sign;
-        else {
-            while (!(mant & 0x00800000)) { mant <<= 1; exp--; }
-            o.u = sign | ((exp + 113) << 23) | (mant & 0x007FFFFF);
-        }
-    } else {
-        o.u = sign | ((exp + 112) << 23) | mant;
-    }
-    return o.f;
-}
-
-// Estrutura física Q8_0 (34 bytes)
-#define QK8_0 32
-struct block_q8_0 {
-    ggml_fp16_t d;
-    int8_t qs[QK8_0];
-};
-
-// Estrutura física Q4_K (144 bytes)
-#define QK_K 256
-#define K_SCALE_SIZE 12
-struct block_q4_K {
-    ggml_fp16_t d;
-    ggml_fp16_t dmin;
-    uint8_t scales[K_SCALE_SIZE];
-    uint8_t qs[QK_K / 2];
-};
-
-// Estrutura física Q6_K (210 bytes)
-struct block_q6_K {
-    uint8_t ql[QK_K / 2];      // 128 bytes (lower 4 bits)
-    uint8_t qh[QK_K / 4];      // 64 bytes  (upper 2 bits)
-    int8_t  scales[QK_K / 16]; // 16 bytes  (sub-block scales)
-    ggml_fp16_t d;             // 2 bytes   (super-block scale)
-};
-
-static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
-    }
-}
 
 // ============================================================================
 // 2. KERNELS DE PRODUTO ESCALAR "ON-THE-FLY" (GEMV) MULTI-THREAD (OPENMP)
@@ -107,14 +47,15 @@ void gemv_q8_0(const char* matrix_weights, const float* x, float* out, int num_r
     }
 }
 
-// GEMV para Tensores Q4_K (Int4)
-void gemv_q4_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+// GEMV para Tensores Q4_K (Int4) - Escalar Puro
+void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
     #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
-        float row_sum = 0.0f;
+        float sum1 = 0.0f;
+        float sum2 = 0.0f;
         int row_block_offset = r * super_blocks_per_row;
 
         for (int sb = 0; sb < super_blocks_per_row; ++sb) {
@@ -138,25 +79,37 @@ void gemv_q4_K(const char* matrix_weights, const float* x, float* out, int num_r
                 for (int l = 0; l < 32; ++l) {
                     float w1 = d1 * (q[l] & 0xF) - m1;
                     float w2 = d2 * (q[l] >> 4) - m2;
-                    row_sum += w1 * x[x_offset + j + l];
-                    row_sum += w2 * x[x_offset + j + l + 32];
+                    sum1 += w1 * x[x_offset + j + l];
+                    sum2 += w2 * x[x_offset + j + l + 32];
                 }
                 q += 32;
                 is += 2;
             }
         }
-        out[r] = row_sum;
+        out[r] = sum1 + sum2;
     }
 }
 
-// GEMV para Tensores Q6_K (Int6)
-void gemv_q6_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+// Dispatcher para GEMV Q4_K
+void gemv_q4_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+#if defined(__AVX2__)
+    gemv_q4_K_avx2(matrix_weights, x, out, num_rows, num_cols);
+#else
+    gemv_q4_K_scalar(matrix_weights, x, out, num_rows, num_cols);
+#endif
+}
+
+// GEMV para Tensores Q6_K (Int6) - Escalar Puro
+void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
     #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
-        float row_sum = 0.0f;
+        float sum1 = 0.0f;
+        float sum2 = 0.0f;
+        float sum3 = 0.0f;
+        float sum4 = 0.0f;
         int row_block_offset = r * super_blocks_per_row;
 
         for (int sb = 0; sb < super_blocks_per_row; ++sb) {
@@ -169,27 +122,60 @@ void gemv_q6_K(const char* matrix_weights, const float* x, float* out, int num_r
             const int8_t* sc = bloco.scales;
 
             for (int n = 0; n < QK_K; n += 128) {
-                for (int l = 0; l < 32; ++l) {
-                    int is = l / 16;
-                    
+                // Primeira metade do loop (l = 0..15, is = 0)
+                float s0 = d * sc[0];
+                float s2 = d * sc[2];
+                float s4 = d * sc[4];
+                float s6 = d * sc[6];
+
+                for (int l = 0; l < 16; ++l) {
                     // Reconstroi os 6-bits signed inteiros (offset -32)
                     int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
                     int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
                     int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                    row_sum += d * sc[is + 0] * q1 * x[x_offset + n + l +  0];
-                    row_sum += d * sc[is + 2] * q2 * x[x_offset + n + l + 32];
-                    row_sum += d * sc[is + 4] * q3 * x[x_offset + n + l + 64];
-                    row_sum += d * sc[is + 6] * q4 * x[x_offset + n + l + 96];
+                    sum1 += s0 * q1 * x[x_offset + n + l +  0];
+                    sum2 += s2 * q2 * x[x_offset + n + l + 32];
+                    sum3 += s4 * q3 * x[x_offset + n + l + 64];
+                    sum4 += s6 * q4 * x[x_offset + n + l + 96];
                 }
+
+                // Segunda metade do loop (l = 16..31, is = 1)
+                float s1 = d * sc[1];
+                float s3 = d * sc[3];
+                float s5 = d * sc[5];
+                float s7 = d * sc[7];
+
+                for (int l = 16; l < 32; ++l) {
+                    // Reconstroi os 6-bits signed inteiros (offset -32)
+                    int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                    sum1 += s1 * q1 * x[x_offset + n + l +  0];
+                    sum2 += s3 * q2 * x[x_offset + n + l + 32];
+                    sum3 += s5 * q3 * x[x_offset + n + l + 64];
+                    sum4 += s7 * q4 * x[x_offset + n + l + 96];
+                }
+
                 ql += 64;
                 qh += 32;
                 sc += 8;
             }
         }
-        out[r] = row_sum;
+        out[r] = sum1 + sum2 + sum3 + sum4;
     }
+}
+
+// Dispatcher para GEMV Q6_K
+void gemv_q6_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+#if defined(__AVX2__)
+    gemv_q6_K_avx2(matrix_weights, x, out, num_rows, num_cols);
+#else
+    gemv_q6_K_scalar(matrix_weights, x, out, num_rows, num_cols);
+#endif
 }
 
 // ============================================================================
@@ -292,12 +278,14 @@ void execute_attention(std::vector<float>& attn_out,
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     int num_queries_per_kv = num_heads / num_kv_heads;
 
+    std::vector<float> all_scores(num_heads * (pos + 1));
+
     #pragma omp parallel for
     for (int h = 0; h < num_heads; ++h) {
         int kv_h = h / num_queries_per_kv;
         const float* q_h = q.data() + h * head_dim;
         
-        std::vector<float> scores(pos + 1);
+        float* scores = all_scores.data() + h * (pos + 1);
         float max_score = -1e9f;
 
         // Q * K_T (Produto Escalar com todos os tokens passados)
@@ -328,9 +316,15 @@ void execute_attention(std::vector<float>& attn_out,
 
         // Output = Softmax_Scores * V
         float* out_h = attn_out.data() + h * head_dim;
-        std::fill(out_h, out_h + head_dim, 0.0f);
 
-        for (int t = 0; t <= pos; ++t) {
+        // Inicializa com t = 0 diretamente para evitar std::fill
+        const float* v_h_0 = kv_cache.v.data() + (0 * kv_size_per_token) + (kv_h * head_dim);
+        float score_0 = scores[0];
+        for (int i = 0; i < head_dim; ++i) {
+            out_h[i] = score_0 * v_h_0[i];
+        }
+
+        for (int t = 1; t <= pos; ++t) {
             const float* v_h_t = kv_cache.v.data() + (t * kv_size_per_token) + (kv_h * head_dim);
             float score = scores[t];
             

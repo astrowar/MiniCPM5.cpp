@@ -21,6 +21,7 @@ include_directories(include)
 add_executable(minicpm_engine
     src/main.cpp
     src/ops.cpp
+    src/ops_avx2.cpp
 )
 
 # Compiler flags for optimization (GCC/Clang)
