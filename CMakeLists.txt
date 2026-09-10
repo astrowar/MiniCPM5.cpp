@@ -26,7 +26,8 @@ add_executable(minicpm_engine
 
 # Compiler flags for optimization (GCC/Clang)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(minicpm_engine PRIVATE -O3 -march=native -ffast-math)
+    # Enable high optimization, native architecture tuning, and explicitly enable AVX2 & FMA extensions
+    target_compile_options(minicpm_engine PRIVATE -O3 -march=native -mavx2 -mfma -ffast-math)
 endif()
 
 # Link OpenMP if found
