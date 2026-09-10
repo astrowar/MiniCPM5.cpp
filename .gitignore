@@ -1,0 +1,37 @@
+# Build directories
+/build/
+/build-profile/
+/out/
+/CMakeFiles/
+/Testing/
+/.cmake/
+
+# CMake generated files
+/CMakeCache.txt
+/cmake_install.cmake
+/build.ninja
+/compile_commands.json
+/VSInheritEnvironments.txt
+
+# Visual Studio / VS Code generated caches
+/.vs/
+*.VC.db
+*.VC.opendb
+
+# Compiled artifacts
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Local model files
+*.gguf

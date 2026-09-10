@@ -1,4 +1,5 @@
 #include "minicpm_metadata.h"
+#include "minicpm_special_tokens.h"
 #include "ops.h"
 #include <iostream>
 #include <fstream>
@@ -92,6 +93,7 @@ public:
                     vocab_[j] = token;
                     vocab_map_[vocab_[j]] = j;
                 }
+                build_control_tokens_index();
                 found = true;
                 break;
             } else {
@@ -162,18 +164,92 @@ public:
             start_idx = 1;
         }
 
+        // Parse control tokens directly from raw text before byte-level mapping.
+        // This preserves explicit template tokens such as <|im_start|>, <|im_end|>, <think>, etc.
+        size_t i = start_idx;
+        std::string plain_segment;
+        while (i < text.size()) {
+            std::string matched_control_token;
+            if (find_control_token_at(text, i, matched_control_token)) {
+                auto control_it = vocab_map_.find(matched_control_token);
+                if (control_it != vocab_map_.end()) {
+                    if (!plain_segment.empty()) {
+                        tokenize_plain_text(plain_segment, tokens);
+                        plain_segment.clear();
+                    }
+                    tokens.push_back(control_it->second);
+                    i += matched_control_token.size();
+                    continue;
+                }
+            }
+
+            plain_segment.push_back(text[i]);
+            i++;
+        }
+
+        if (!plain_segment.empty()) {
+            tokenize_plain_text(plain_segment, tokens);
+        }
+        return tokens;
+    }
+
+private:
+    std::vector<std::string> vocab_;
+    std::unordered_map<std::string, int> vocab_map_;
+    std::vector<std::string> control_tokens_;
+    std::string byte_buffer_;
+
+    std::vector<std::string> byte_to_unicode_;
+    std::unordered_map<std::string, uint8_t> unicode_to_byte_;
+
+    bool is_control_token_candidate(const std::string& token) const {
+        if (token.size() >= 4 && token.rfind("<|", 0) == 0 && token.compare(token.size() - 2, 2, "|>") == 0) return true;
+        if (token.size() >= 3 && token.front() == '<' && token.back() == '>') return true;
+        if (is_minicpm5_special_token(token)) return true;
+        return false;
+    }
+
+    void build_control_tokens_index() {
+        control_tokens_.clear();
+        control_tokens_.reserve(64);
+        for (const auto& token : vocab_) {
+            if (is_control_token_candidate(token)) {
+                control_tokens_.push_back(token);
+            }
+        }
+
+        std::sort(control_tokens_.begin(), control_tokens_.end(), [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return a.size() > b.size();
+            return a < b;
+        });
+        control_tokens_.erase(std::unique(control_tokens_.begin(), control_tokens_.end()), control_tokens_.end());
+    }
+
+    bool find_control_token_at(const std::string& text, size_t pos, std::string& out_token) const {
+        for (const auto& token : control_tokens_) {
+            if (token.empty()) continue;
+            if (pos + token.size() > text.size()) continue;
+            if (text.compare(pos, token.size(), token) == 0) {
+                out_token = token;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void tokenize_plain_text(const std::string& plain_text, std::vector<int>& out_tokens) const {
         std::string mapped_text = "";
-        for (size_t i = start_idx; i < text.size(); ++i) {
-            unsigned char c = text[i];
+        for (size_t i = 0; i < plain_text.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(plain_text[i]);
             mapped_text += byte_to_unicode_[c];
         }
 
         size_t i = 0;
-        while (i < mapped_text.length()) {
+        while (i < mapped_text.size()) {
             int best_id = -1;
             size_t best_len = 0;
 
-            for (size_t len = mapped_text.length() - i; len > 0; len--) {
+            for (size_t len = mapped_text.size() - i; len > 0; len--) {
                 std::string sub = mapped_text.substr(i, len);
                 auto it = vocab_map_.find(sub);
                 if (it != vocab_map_.end()) {
@@ -184,22 +260,14 @@ public:
             }
 
             if (best_id != -1) {
-                tokens.push_back(best_id);
+                out_tokens.push_back(best_id);
                 i += best_len;
             } else {
+                // Preserve progress even if no direct vocab match was found at this byte.
                 i++;
             }
         }
-        return tokens;
     }
-
-private:
-    std::vector<std::string> vocab_;
-    std::unordered_map<std::string, int> vocab_map_;
-    std::string byte_buffer_;
-
-    std::vector<std::string> byte_to_unicode_;
-    std::unordered_map<std::string, uint8_t> unicode_to_byte_;
 
     void init_unicode_mappings() {
         byte_to_unicode_.resize(256);
@@ -733,6 +801,9 @@ int main(int argc, char** argv) {
     }
 
     int next_token = -1;
+    auto is_stop_token = [](int token_id) {
+        return token_id == 1 || token_id == 2 || token_id == 130073;
+    };
     auto t_start_prompt = std::chrono::high_resolution_clock::now();
     for (size_t pos = 0; pos < prompt_tokens.size(); ++pos) {
         int token_id = prompt_tokens[pos];
@@ -748,7 +819,12 @@ int main(int argc, char** argv) {
     auto t_end_prompt = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> prompt_time = t_end_prompt - t_start_prompt;
 
-    std::cout << tokenizer.decode(next_token) << std::flush;
+    bool stop_after_prompt = is_stop_token(next_token);
+    if (!stop_after_prompt) {
+        std::cout << tokenizer.decode(next_token) << std::flush;
+    } else if (verbose) {
+        std::cout << "\n[Stop] EOS token detected right after prompt (id=" << next_token << ")." << std::endl;
+    }
 
     // Geração autoregressiva estocástica
     int current_pos = prompt_tokens.size();
@@ -756,20 +832,20 @@ int main(int argc, char** argv) {
 
     if (verbose) std::cout << "\n[Inference] Starting autoregressive generation (max " << max_gen_tokens << " tokens)..." << std::endl;
     auto t_start_gen = std::chrono::high_resolution_clock::now();
-    for (int step = 0; step < max_gen_tokens; step++) {
+    for (int step = 0; step < max_gen_tokens && !stop_after_prompt; step++) {
         std::vector<float> logits = engine.forward(next_token, current_pos, context_size);
 
         next_token = sample_token(logits, 1.0f, 0.95f);
         current_pos++;
-        num_generated++;
-
-        std::string decoded = tokenizer.decode(next_token);
-        std::cout << decoded << std::flush;
-
-        if (next_token == 1 || next_token == 2 || next_token == 130073) {
+        if (is_stop_token(next_token)) {
             if (verbose) std::cout << "\n[Stop] EOS token detected (id=" << next_token << "). Stopping generation." << std::endl;
             break;
         }
+
+        num_generated++;
+        std::string decoded = tokenizer.decode(next_token);
+        std::cout << decoded << std::flush;
+
         if (step == max_gen_tokens - 1) {
             if (verbose) std::cout << "\n[Stop] Max tokens (" << max_gen_tokens << ") reached." << std::endl;
         }
