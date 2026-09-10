@@ -12,6 +12,9 @@
 #include <memory>
 #include <random>
 #include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 // ============================================================================
 // 1. ESTRUTURAS DE DADOS DE ARQUITETURA DO MODELO (LAYERS & WEIGHTS)
@@ -322,7 +325,7 @@ std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool a
         if (enable_think) {
             prompt += "<|im_start|>assistant\n<think>\n";
         } else {
-            prompt += "<|im_start|>assistant\n";
+            prompt += "<|im_start|>assistant\n<think>\nNo think is needed for this response.\n\n</think>\n\n";
         }
     }
     return prompt;
@@ -487,7 +490,7 @@ public:
             matmul(attn_output, attn_out_temp, layer.attn_output);
 
             // Conexão Residual da Atenção
-            #pragma omp parallel for simd
+            #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x[i] = residual[i] + attn_output[i];
             }
@@ -503,7 +506,7 @@ public:
             matmul(up, x_norm, layer.ffn_up);
 
             // Ativação SwiGLU: silu(gate) * up
-            #pragma omp parallel for simd
+            #pragma omp parallel for
             for (int i = 0; i < MODEL_FFN_DIM; i++) {
                 ffn_intermediate[i] = silu(gate[i]) * up[i];
             }
@@ -512,7 +515,7 @@ public:
             matmul(ffn_output, ffn_intermediate, layer.ffn_down);
 
             // Conexão Residual da FFN
-            #pragma omp parallel for simd
+            #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x[i] = residual[i] + ffn_output[i];
             }
@@ -610,11 +613,17 @@ int sample_token(std::vector<float>& logits, float temperature = 1.0f, float top
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Ensure UTF-8 text emitted by the model is rendered correctly in Windows consoles.
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     std::string text_prompt = "O Brasil é um país";
     bool enable_think = true;
     std::string model_path = "MiniCPM5-2B-Q4_K_M.gguf";
-    int context_size = 1024;
-    int max_gen_tokens = 25;
+    int context_size = 8192;
+    int max_gen_tokens = 1024;
     bool verbose = false;
 
     // Parse options
@@ -625,8 +634,8 @@ int main(int argc, char** argv) {
                       << "Options:\n"
                       << "  --text \"...\"      Input prompt text (default: \"O Brasil é um país\")\n"
                       << "  -m <path>         Path to GGUF model\n"
-                      << "  -c <size>         Context size (default: 1024)\n"
-                      << "  -n <count>        Max generation tokens (default: 25)\n"
+                      << "  -c <size>         Context size (default: 8192)\n"
+                      << "  -n <count>        Max generation tokens (default: 1024)\n"
                       << "  --no-think        Disable <think> reasoning tag generation\n"
                       << "  -v, --verbose     Show detailed generation logs and progress\n"
                       << "  --help, -h        Show this help message\n";
@@ -660,13 +669,8 @@ int main(int argc, char** argv) {
 
     // Fallback inicial para encontrar o modelo por padrao
     bool model_found = false;
-    if (std::ifstream("../../MiniCPM5-2B-Q4_K_M.gguf")) {
-        model_path = "../../MiniCPM5-2B-Q4_K_M.gguf";
-        model_found = true;
-        if (verbose) std::cout << "[Model] Found via fallback: " << model_path << std::endl;
-    }
-    else if (std::ifstream("../MiniCPM5-2B-Q4_K_M.gguf")) {
-        model_path = "../MiniCPM5-2B-Q4_K_M.gguf";
+    if (std::ifstream("MiniCPM5-2B-Q4_K_M.gguf")) {
+        model_path = "MiniCPM5-2B-Q4_K_M.gguf";
         model_found = true;
         if (verbose) std::cout << "[Model] Found via fallback: " << model_path << std::endl;
     }

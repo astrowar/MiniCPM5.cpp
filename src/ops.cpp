@@ -238,7 +238,7 @@ void rmsnorm(std::vector<float>& out, const std::vector<float>& x, const Tensor&
     float rms = 1.0f / std::sqrt(sum / dim + eps);
     if (out.size() != dim) out.resize(dim);
     
-    #pragma omp parallel for simd
+    #pragma omp parallel for
     for (int i = 0; i < dim; i++) {
         out[i] = x[i] * rms * w[i];
     }
