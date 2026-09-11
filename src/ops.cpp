@@ -1,5 +1,6 @@
 #include "ops.h"
 #include "ops_internal.h"
+#include "ops_scalar_optimized.h"
 #include <cmath>
 #include <iostream>
 #include <cassert>
@@ -213,22 +214,10 @@ void matmul(std::vector<float>& output, const std::vector<float>& input, const T
 void quantize_row_q8_K(const float* x, int n, block_q8_K* y) {
 #if defined(__AVX2__)
     quantize_row_q8_K_avx2(x, y, n);
+#elif defined(__ARM_NEON)
+    quantize_row_q8_K_neon(x, y, n);
 #else
-    for (int ib = 0; ib < n / QK_K; ++ib) {
-        const float* xb = x + ib * QK_K;
-        block_q8_K& dst = y[ib];
-        float amax = 0.0f;
-        for (int i = 0; i < QK_K; ++i) amax = std::max(amax, std::fabs(xb[i]));
-        if (amax == 0.0f) { dst.d = 0.0f; std::memset(dst.qs, 0, QK_K); std::memset(dst.bsums, 0, sizeof(dst.bsums)); continue; }
-        dst.d = amax / 127.0f;
-        float mul = 127.0f / amax;
-        for (int i = 0; i < QK_K; ++i) dst.qs[i] = (int8_t)std::max(-127.0f, std::min(127.0f, (float)std::lround(xb[i] * mul)));
-        for (int g = 0; g < QK_K / 16; ++g) {
-            int32_t s = 0;
-            for (int i = 0; i < 16; ++i) s += dst.qs[g * 16 + i];
-            dst.bsums[g] = (int16_t)s;
-        }
-    }
+    quantize_row_q8_K_scalar(x, y, n);
 #endif
 }
 
@@ -242,6 +231,30 @@ void matmul_q8k(std::vector<float>& output, const block_q8_K* input_q8k, int num
         gemv_q4_K_q8_K_avx2(tensor.data_ptr, input_q8k, output.data(), num_rows, num_cols);
     } else if (tensor.type_str == "Q6_K") {
         gemv_q6_K_q8_K_avx2(tensor.data_ptr, input_q8k, output.data(), num_rows, num_cols);
+    } else
+#else
+    if (tensor.type_str == "Q4_K") {
+        const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(tensor.data_ptr);
+        int nb = num_cols / QK_K;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < num_rows; ++r) {
+#if defined(__ARM_NEON)
+            output[r] = dot_row_q4_K_q8_K_neon(blocks + r*nb, input_q8k, nb);
+#else
+            output[r] = dot_row_q4_K_q8_K_scalar(blocks + r*nb, input_q8k, nb);
+#endif
+        }
+    } else if (tensor.type_str == "Q6_K") {
+        const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(tensor.data_ptr);
+        int nb = num_cols / QK_K;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < num_rows; ++r) {
+#if defined(__ARM_NEON)
+            output[r] = dot_row_q6_K_q8_K_neon(blocks + r*nb, input_q8k, nb);
+#else
+            output[r] = dot_row_q6_K_q8_K_scalar(blocks + r*nb, input_q8k, nb);
+#endif
+        }
     } else
 #endif
     {
@@ -267,12 +280,73 @@ void matmul_qkv_q8k(std::vector<float>& q, std::vector<float>& k, std::vector<fl
     if (tensor_v.type_str == "Q4_K") {
         gemv_qkv_q4_K_q8_K_avx2(tensor_q.data_ptr, tensor_k.data_ptr, tensor_v.data_ptr,
                                  input_q8k, q.data(), k.data(), v.data(), q_rows, kv_rows, num_cols);
+        return;
     } else if (tensor_v.type_str == "Q6_K") {
         gemv_qkv_q4_q4_q6_q8_K_avx2(tensor_q.data_ptr, tensor_k.data_ptr, tensor_v.data_ptr,
                                      input_q8k, q.data(), k.data(), v.data(), q_rows, kv_rows, num_cols);
-    } else
+        return;
+    }
 #endif
-    {
+
+    int nb = num_cols / QK_K;
+    const block_q4_K* bq = reinterpret_cast<const block_q4_K*>(tensor_q.data_ptr);
+    const block_q4_K* bk = reinterpret_cast<const block_q4_K*>(tensor_k.data_ptr);
+
+    if (tensor_v.type_str == "Q4_K") {
+        const block_q4_K* bv = reinterpret_cast<const block_q4_K*>(tensor_v.data_ptr);
+        int total = q_rows + kv_rows + kv_rows;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < total; ++r) {
+            if (r < q_rows) {
+#if defined(__ARM_NEON)
+                q[r] = dot_row_q4_K_q8_K_neon(bq + r*nb, input_q8k, nb);
+#else
+                q[r] = dot_row_q4_K_q8_K_scalar(bq + r*nb, input_q8k, nb);
+#endif
+            } else if (r < q_rows + kv_rows) {
+                int kr = r - q_rows;
+#if defined(__ARM_NEON)
+                k[kr] = dot_row_q4_K_q8_K_neon(bk + kr*nb, input_q8k, nb);
+#else
+                k[kr] = dot_row_q4_K_q8_K_scalar(bk + kr*nb, input_q8k, nb);
+#endif
+            } else {
+                int vr = r - q_rows - kv_rows;
+#if defined(__ARM_NEON)
+                v[vr] = dot_row_q4_K_q8_K_neon(bv + vr*nb, input_q8k, nb);
+#else
+                v[vr] = dot_row_q4_K_q8_K_scalar(bv + vr*nb, input_q8k, nb);
+#endif
+            }
+        }
+    } else if (tensor_v.type_str == "Q6_K") {
+        const block_q6_K* bv = reinterpret_cast<const block_q6_K*>(tensor_v.data_ptr);
+        int total = q_rows + kv_rows + kv_rows;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < total; ++r) {
+            if (r < q_rows) {
+#if defined(__ARM_NEON)
+                q[r] = dot_row_q4_K_q8_K_neon(bq + r*nb, input_q8k, nb);
+#else
+                q[r] = dot_row_q4_K_q8_K_scalar(bq + r*nb, input_q8k, nb);
+#endif
+            } else if (r < q_rows + kv_rows) {
+                int kr = r - q_rows;
+#if defined(__ARM_NEON)
+                k[kr] = dot_row_q4_K_q8_K_neon(bk + kr*nb, input_q8k, nb);
+#else
+                k[kr] = dot_row_q4_K_q8_K_scalar(bk + kr*nb, input_q8k, nb);
+#endif
+            } else {
+                int vr = r - q_rows - kv_rows;
+#if defined(__ARM_NEON)
+                v[vr] = dot_row_q6_K_q8_K_neon(bv + vr*nb, input_q8k, nb);
+#else
+                v[vr] = dot_row_q6_K_q8_K_scalar(bv + vr*nb, input_q8k, nb);
+#endif
+            }
+        }
+    } else {
         static bool warned = false;
         if (!warned) {
             std::cout << "[AVISO] matmul_qkv_q8k: tipo v=" << tensor_v.type_str << " nao suportado." << std::endl;
@@ -295,9 +369,26 @@ void matmul_gate_up_q8k(std::vector<float>& gate, std::vector<float>& up,
     if (tensor_gate.type_str == "Q4_K" && tensor_up.type_str == "Q4_K") {
         gemv_gate_up_q4_K_q8_K_avx2(tensor_gate.data_ptr, tensor_up.data_ptr,
                                      input_q8k, gate.data(), up.data(), num_rows, num_cols);
-    } else
+        return;
+    }
 #endif
-    {
+
+    int nb = num_cols / QK_K;
+
+    if (tensor_gate.type_str == "Q4_K" && tensor_up.type_str == "Q4_K") {
+        const block_q4_K* bg = reinterpret_cast<const block_q4_K*>(tensor_gate.data_ptr);
+        const block_q4_K* bu = reinterpret_cast<const block_q4_K*>(tensor_up.data_ptr);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < num_rows; ++r) {
+#if defined(__ARM_NEON)
+            gate[r] = dot_row_q4_K_q8_K_neon(bg + r*nb, input_q8k, nb);
+            up[r]   = dot_row_q4_K_q8_K_neon(bu + r*nb, input_q8k, nb);
+#else
+            gate[r] = dot_row_q4_K_q8_K_scalar(bg + r*nb, input_q8k, nb);
+            up[r]   = dot_row_q4_K_q8_K_scalar(bu + r*nb, input_q8k, nb);
+#endif
+        }
+    } else {
         static bool warned = false;
         if (!warned) {
             std::cout << "[AVISO] matmul_gate_up_q8k: tipos nao suportados." << std::endl;

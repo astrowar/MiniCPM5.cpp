@@ -15,10 +15,10 @@ endif()
 find_package(OpenMP)
 
 # Define the include directory
-include_directories(include src)
+include_directories(include src otimizacao_scalar)
 
 # Set base sources
-set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp)
+set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp otimizacao_scalar/ops_scalar_optimized.cpp)
 set(SIMD_FLAGS "")
 
 # Architecture-specific AVX2 detection
@@ -48,7 +48,18 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i686|i386|x86)")
         endif()
     endif()
 else()
-    message(STATUS "Non-x86 architecture detected (${CMAKE_SYSTEM_PROCESSOR}). Disabling AVX2 support.")
+    message(STATUS "Non-x86 architecture detected (${CMAKE_SYSTEM_PROCESSOR}).")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm.*|aarch64.*|ARM.*|AARCH64.*)")
+        message(STATUS "ARM architecture detected. Enabling NEON optimization.")
+        list(APPEND SOURCES src/ops_neon.cpp)
+        add_compile_definitions(__ARM_NEON)
+        # For 32-bit ARM, NEON needs to be explicitly enabled in GCC/Clang
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7.*|armv8l|arm)$" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            set(SIMD_FLAGS "-mfpu=neon")
+        endif()
+    else()
+        message(STATUS "Disabling SIMD support (using scalar fallback).")
+    endif()
 endif()
 
 # Define the executable and its source files

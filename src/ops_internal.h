@@ -91,3 +91,8 @@ void gemv_gate_up_q4_K_q8_K_avx2(const char* w_gate, const char* w_up,
                                   const block_q8_K* xq,
                                   float* gate, float* up,
                                   int num_rows, int num_cols);
+
+// NEON (ARM) kernels
+void quantize_row_q8_K_neon(const float* x, block_q8_K* y, int n);
+float dot_row_q4_K_q8_K_neon(const block_q4_K* w, const block_q8_K* xq, int num_blocks);
+float dot_row_q6_K_q8_K_neon(const block_q6_K* w, const block_q8_K* xq, int num_blocks);
