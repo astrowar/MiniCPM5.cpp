@@ -1,0 +1,526 @@
+Sim. Já deixei uma versão compatível com a estrutura atual do seu projeto e validei a compilação com `-O3 -mavx2 -mfma -fopenmp`.
+
+O ponto importante é que **você não precisa alterar `ops.cpp` agora**: mantive as funções `gemv_q4_K_avx2(...)` e `gemv_q6_K_avx2(...)` com as mesmas assinaturas usadas pelo dispatcher atual. 
+
+### Arquivos prontos
+
+Substitua seu `src/ops_avx2.cpp` por este:
+
+[Baixar `ops_avx2.cpp`](sandbox:/mnt/data/ops_avx2.cpp)
+
+E substitua seu `src/ops_internal.h` por este:
+
+[Baixar `ops_internal.h`](sandbox:/mnt/data/ops_internal.h)
+
+Seu CMake atual já habilita `-mavx2 -mfma` e `-O3`, então não é necessária mudança imediata nele. 
+
+A arquitetura agora fica assim:
+
+```text
+antes:
+
+float x
+   │
+   ├──────────────┐
+   │              │
+Q4_K weights   Q6_K weights
+   │              │
+dequant FP32   dequant FP32
+   │              │
+ float MUL      float MUL
+   │              │
+   └──────┬───────┘
+          ↓
+        output
+
+
+agora:
+
+float x
+   │
+   │ quantize UMA VEZ
+   ↓
+ Q8_K
+   │
+   ├─────────────────────┐
+   │                     │
+Q4_K × Q8_K          Q6_K × Q8_K
+   │                     │
+INT8/INT16/INT32      INT8/INT16/INT32
+   │                     │
+   └──────────┬──────────┘
+              ↓
+            FP32
+```
+
+Esse desenho segue a mesma ideia usada pelo `ggml`: `block_q8_K` contém `d`, 256 valores `int8_t` e 16 `bsums`; estes últimos são particularmente úteis para o termo `dmin` do Q4_K. ([GitHub][1])
+
+## O que adicionei
+
+No `ops_internal.h` agora existe:
+
+```cpp
+struct block_q8_K {
+    float   d;
+    int8_t  qs[QK_K];
+    int16_t bsums[QK_K / 16];
+};
+
+static_assert(sizeof(block_q8_K) == 292);
+```
+
+E três APIs novas:
+
+```cpp
+void quantize_row_q8_K_avx2(
+    const float* x,
+    block_q8_K* y,
+    int n
+);
+
+void gemv_q4_K_q8_K_avx2(
+    const char* matrix_weights,
+    const block_q8_K* xq,
+    float* out,
+    int num_rows,
+    int num_cols
+);
+
+void gemv_q6_K_q8_K_avx2(
+    const char* matrix_weights,
+    const block_q8_K* xq,
+    float* out,
+    int num_rows,
+    int num_cols
+);
+```
+
+O `llama.cpp` também registra Q4_K e Q6_K usando Q8_K como tipo de ativação para dot product, em vez de converter todos os pesos para FP32. ([GitHub][2])
+
+### Q4_K
+
+Seu kernel antigo fazia:
+
+```cpp
+__m256 f1 = _mm256_cvtepi32_ps(q1_epi32);
+
+__m256 w1 =
+    _mm256_sub_ps(
+        _mm256_mul_ps(vd1, f1),
+        vm1
+    );
+
+acc1 = _mm256_add_ps(
+    acc1,
+    _mm256_mul_ps(w1, vx1)
+);
+```
+
+Ou seja:
+
+```text
+Q4
+ ↓
+INT32
+ ↓
+FP32
+ ↓
+scale
+ ↓
+FP32 multiply
+```
+
+Isso acontece para todos os pesos. 
+
+Agora o inner loop faz essencialmente:
+
+```cpp
+const __m256i p_lo =
+    _mm256_maddubs_epi16(qlo, xlo);
+
+isum = _mm256_add_epi32(
+    isum,
+    _mm256_madd_epi16(
+        p_lo,
+        _mm256_set1_epi16(scale)
+    )
+);
+```
+
+Então:
+
+```text
+Q4 bytes
+    │
+    │ _mm256_maddubs_epi16
+    ↓
+ INT16
+    │
+    │ _mm256_madd_epi16
+    ↓
+ INT32 accumulation
+    │
+    ↓
+ escala FP32 apenas no final do superblock
+```
+
+Muito menos conversão.
+
+O `llama.cpp` usa justamente `_mm256_maddubs_epi16` e `_mm256_madd_epi16` no caminho AVX2 de Q4_K×Q8_K. 
+
+## E o `dmin` do Q4_K?
+
+Esse é o motivo de termos:
+
+```cpp
+int16_t bsums[16];
+```
+
+Ao quantizar:
+
+```text
+256 valores Q8
+
+0..15     → bsums[0]
+16..31    → bsums[1]
+...
+240..255  → bsums[15]
+```
+
+Então não precisamos calcular novamente:
+
+```text
+min × x[0]
+min × x[1]
+...
+```
+
+O código novo faz:
+
+```cpp
+int32_t minsum = 0;
+
+for (int g = 0; g < 8; ++g) {
+    const int q8sum32 =
+        a.bsums[2*g] +
+        a.bsums[2*g + 1];
+
+    minsum += mins[g] * q8sum32;
+}
+```
+
+e no fim:
+
+```cpp
+return a.d *
+    (
+        d * integer_dot
+        -
+        dmin * minsum
+    );
+```
+
+É uma economia grande comparada a aplicar `dmin` individualmente a cada peso. O formato Q8_K do ggml mantém exatamente esses `bsums`. ([GitHub][1])
+
+---
+
+# Q6_K ficou ainda mais interessante
+
+No seu kernel antigo você fazia para cada grupo:
+
+```cpp
+__m256 w1 = _mm256_cvtepi32_ps(q1);
+
+acc1 = _mm256_add_ps(
+    acc1,
+    _mm256_mul_ps(
+        _mm256_mul_ps(w1, vs0),
+        vx1
+    )
+);
+```
+
+Ou seja:
+
+```text
+Q6
+ ↓
+INT32
+ ↓
+FP32
+ ↓
+float × float × float
+```
+
+
+
+Agora reconstruo o Q6 diretamente como `int8_t`:
+
+```cpp
+q0 = ...
+q1 = ...
+q2 = ...
+q3 = ...
+
+q0 = _mm256_sub_epi8(q0, off32);
+q1 = _mm256_sub_epi8(q1, off32);
+```
+
+resultando em:
+
+```text
+[-32 ... +31]
+```
+
+Depois faço signed × signed INT8:
+
+```cpp
+static inline __m256i mul_signed_i8_pairs(
+    __m256i x,
+    __m256i y
+) {
+    const __m256i ax =
+        _mm256_sign_epi8(x, x);
+
+    const __m256i sy =
+        _mm256_sign_epi8(y, x);
+
+    return _mm256_maddubs_epi16(ax, sy);
+}
+```
+
+e os scales Q6 também são aplicados ainda em inteiro:
+
+```cpp
+_mm256_madd_epi16(
+    mul_signed_i8_pairs(q0, x0),
+    scale_pair_i16(sc[0], sc[1])
+)
+```
+
+Então só depois do superblock inteiro convertemos:
+
+```cpp
+return
+    activation.d *
+    fp16_to_fp32(weight.d) *
+    float(integer_sum);
+```
+
+O caminho AVX2 do `llama.cpp` para Q6_K também mantém o produto em inteiro e usa `maddubs/madd` antes da escala FP32. 
+
+---
+
+## A quantização FP32 → Q8_K também está AVX2
+
+Não fiz uma quantização escalar.
+
+Primeiro são procurados os máximos de 8 floats por vez:
+
+```cpp
+__m256 v = _mm256_loadu_ps(x + i);
+
+vmax = _mm256_max_ps(
+    vmax,
+    _mm256_andnot_ps(sign_bit, v)
+);
+```
+
+Depois:
+
+```cpp
+dst.d = amax / 127.0f;
+
+const __m256 mul =
+    _mm256_set1_ps(127.0f / amax);
+```
+
+E os floats viram INT8 usando:
+
+```text
+8 FP32
+ ↓
+8 INT32
+ ↓
+pack
+ ↓
+INT16
+ ↓
+pack
+ ↓
+INT8
+```
+
+A cada 32 elementos:
+
+```cpp
+__m256i p01 = _mm256_packs_epi32(q0, q1);
+__m256i p23 = _mm256_packs_epi32(q2, q3);
+
+__m256i q8 =
+    _mm256_packs_epi16(p01, p23);
+```
+
+Portanto quantizar 2048 ou 6144 floats é muito barato comparado a atravessar centenas de MB ou GB de pesos.
+
+---
+
+# Também removi allocation repetitiva
+
+Usei:
+
+```cpp
+static thread_local
+std::vector<block_q8_K> q8_scratch;
+```
+
+Assim:
+
+```cpp
+q8_scratch.resize(num_cols / QK_K);
+```
+
+normalmente só aloca na primeira vez.
+
+O wrapper antigo continua funcionando:
+
+```cpp
+void gemv_q4_K_avx2(
+    const char* matrix_weights,
+    const float* x,
+    float* out,
+    int num_rows,
+    int num_cols
+) {
+    gemv_q4_K_q8_K_avx2(
+        matrix_weights,
+        prepare_q8(x, num_cols),
+        out,
+        num_rows,
+        num_cols
+    );
+}
+```
+
+Portanto seu `matmul()` continua exatamente com:
+
+```cpp
+gemv_q4_K(...)
+```
+
+e:
+
+```cpp
+gemv_q6_K(...)
+```
+
+sem precisar mexer no restante do engine. 
+
+---
+
+## Compile assim
+
+Eu faria build limpo:
+
+```bash
+rm -rf build
+mkdir build
+cd build
+
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+E teste inicialmente com os mesmos threads que você usa no llama.cpp, por exemplo:
+
+```bash
+OMP_NUM_THREADS=4 ./minicpm_engine ...
+```
+
+ou:
+
+```bash
+OMP_NUM_THREADS=8 ./minicpm_engine ...
+```
+
+Seu CMake atual já coloca `-O3 -march=native -ffast-math -mavx2 -mfma`. 
+
+## Validação que fiz
+
+Antes de te passar, comparei o kernel novo contra a equação do seu kernel original.
+
+Para Q4_K, usando a mesma ativação já quantizada:
+
+```text
+referência: 348.900513
+novo AVX2:  348.900482
+
+diferença ≈ 0.000031
+```
+
+Para Q6_K:
+
+```text
+referência: 5506.260742
+novo AVX2:  5506.267578
+
+diferença ≈ 0.0068
+```
+
+Ou seja, o unpack/layout dos seus Q4_K e Q6_K está coerente com o kernel novo.
+
+O que **vai** gerar pequena diferença de logits em relação ao seu código anterior é isto:
+
+```text
+kernel antigo:
+activation FP32
+
+kernel novo:
+activation FP32 → Q8_K
+```
+
+Isso é esperado.
+
+---
+
+### Um detalhe importante para o próximo passo
+
+A versão que te entreguei deliberadamente mantém sua API atual. Portanto:
+
+```text
+attn_q(x) → quantiza x Q8
+attn_k(x) → quantiza x Q8 novamente
+attn_v(x) → quantiza x Q8 novamente
+```
+
+e também:
+
+```text
+ffn_gate(x) → Q8
+ffn_up(x)   → Q8 novamente
+```
+
+A quantização é pequena comparada ao GEMV, então **primeiro eu testaria exatamente essa versão**.
+
+Mas depois podemos mudar o engine para:
+
+```text
+                    ┌→ Q
+x FP32 → Q8_K uma vez ├→ K
+                    └→ V
+```
+
+e:
+
+```text
+                    ┌→ gate
+x FP32 → Q8_K uma vez
+                    └→ up
+```
+
+Isso deixa a arquitetura mais próxima do que queremos.
+
+**O teste que mais me interessa agora é quanto esses dois arquivos mudam seus `4.8 tok/s`.** Se você rodar e me passar algo como **1, 2, 4 e 8 threads + tok/s**, eu consigo identificar o próximo limitante. Minha próxima mudança seria o **RoPE cacheado**, e depois reduzir as barreiras do OpenMP.
+
+[1]: https://github.com/ggml-org/ggml/blob/master/src/ggml-common.h?utm_source=chatgpt.com "ggml/src/ggml-common.h at master · ggml-org/ggml · GitHub"
+[2]: https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cpu/quants.h?utm_source=chatgpt.com "llama.cpp/ggml/src/ggml-cpu/quants.h at master · ggml-org/llama.cpp · GitHub"

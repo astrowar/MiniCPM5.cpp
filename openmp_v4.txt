@@ -1,0 +1,341 @@
+================================================================================
+OPENMP V4 — PLANO DE IMPLEMENTAÇÃO E OTIMIZAÇÃO (decode, batch=1)
+================================================================================
+Substitui o plano de threadpool manual de OPENMP.MD por OpenMP real (2.0/MSVC),
+com uma ÚNICA região paralela persistente e fusão de fases para eliminar
+sincronizações globais. Objetivo: minimizar tempo/token — não maximizar a
+cobertura de pragmas.
+
+Legenda de tipos de pesos (confirmada em include/minicpm_metadata.h):
+  - attn_q, attn_k, attn_output(o_proj), ffn_gate, ffn_up : Q4_K (todas camadas)
+  - attn_v, ffn_down                                      : Q6_K nas camadas
+        {0,1,2,3,7,10,13,16,19,22,25,28,31}; Q4_K nas demais
+  - output (lm_head)                                      : Q6_K  {2048,130560}
+  - output_norm, *_norm                                   : F32
+  - token_embd                                            : Q4_K
+Ativação intermediária: quantizada UMA VEZ para Q8_K e reutilizada
+(otimização existente, preservada).
+
+================================================================================
+0. PONTOS DE PARTIDA / PRÉ-REQUISITOS (já feitos ou a corrigir)
+================================================================================
+0.1. BUG DE COMPILAÇÃO em include/model.h
+     reset_profile() e report_profile() const estão declarados DUAS vezes:
+     uma no bloco public: e outra no bloco private:. Remover as duas declarações
+     do bloco private: (manter as do public:). Sem isso o projeto não compila.
+
+0.2. include/ops.h JÁ declara os helpers por-range (camada livre de OpenMP):
+       gemv_q4_range / gemv_q6_range
+       gemv_residual_range   (GEMV + residual + partial sumsq)
+       qkv_range             (q,k Q4_K; v Q4_K|Q6_K)
+       gate_up_swiglu_range  (gate+up+SwiGLU fundido, sem buffers temporários)
+0.3. src/ops_avx2.cpp JÁ implementa esses helpers (branch AVX2) e tem stubs
+     #else para não-AVX2. FALTA: incluir <cmath> no topo de ops_avx2.cpp
+     (swiglu_f usa std::exp; os includes atuais não garantem isso).
+
+0.4. src/model.cpp ainda tem o forward() SINGLE-THREAD antigo.
+     Ações: renomear o corpo atual para forward_legacy() (verbatim) e escrever
+     o NOVO forward() (região persistente) + verify() + reset_profile() +
+     report_profile().
+
+0.5. src/main.cpp: adicionar flags --verify e --profile; separar tempo de
+     forward (ms/token) de tempo de sampling (ms/token); reportar tok/s.
+
+================================================================================
+1. REGRAS ARQUITETURAIS (invioláveis)
+================================================================================
+R1. NÃO colocar #pragma omp DENTRO de dot_row_q4_K_q8_K_*, dot_row_q6_K_q8_K_*,
+    quantize_row_q8_K_*. Esses kernels permanecem single-thread (preserva a
+    trocabilidade de ISA: AVX2 -> NEON/SVE/RVV/AVX512). O OpenMP vive em uma
+    CAMADA SUPERIOR que decide ranges de linhas e as fases do forward.
+
+R2. UMA única região OpenMP persistente:
+        #pragma omp parallel
+        { ... loop de camadas ... lm_head ... }
+    Não criar nova região paralela por GEMV. Dentro dela: divisão manual e
+    estática de ranges, #pragma omp single para fases de uma thread,
+    #pragma omp barrier explícito entre fases (cada uma justificada por
+    dependência de dados), e if(l==0) para o primeiro RMSNorm.
+
+R3. Scheduling: estático. begin = total_rows*tid/nth; end = total_rows*(tid+1)/nth.
+    Nunca schedule(dynamic,1) nem atomic fetch_add por linha. Chunks contíguos
+    para leitura sequencial dos pesos (localidade de memória). Work stealing
+    só se um benchmark provar desequilíbrio.
+
+R4. Fusão para ELIMINAR fases (e, portanto, barriers):
+    F-a. gate + up + SwiGLU -> UMA fase: ffn[r] = silu(gate[r]) * up[r]
+         direto (helper gate_up_swiglu_range). Sem buffers gate[]/up[] e sem
+         a fase separada de SwiGLU nem a quantização separada (ver 2.2).
+    F-b. down + residual -> UMA fase: x[r] = residual[r] + down[r]
+         (helper gemv_residual_range) e, no mesmo loop, acumular partial
+         sumsq(x) por thread -> o próximo RMSNorm só reduz N partials.
+    F-c. o_proj + residual -> UMA fase (idem, helper gemv_residual_range).
+         Também acumula partial sumsq para o ffn_norm da MESMA camada.
+    F-d. QKV + RoPE (2ª etapa, opcional): só se não ficar complexa demais.
+
+R5. NÃO paralelizar operações pequenas isoladamente (SwiGLU, RoPE, residual,
+    norms). Atenção (~3%) NÃO é prioridade. Foco: gate/up, down, lm_head,
+    QKV, o_proj.
+
+R6. Toda barrier deve ter justificativa de dependência de dados concreta.
+    "porque terminamos uma função" não basta. nowait só onde estiver provado
+    correto. O forward deve permanecer determinístico (mesma sequência de
+    escritas; diferenças de FP de ordem são ok).
+
+R7. Não assumir que entrada/saída de #pragma omp parallel cria/destrói threads
+    a cada chamada. Confirmar por benchmark (a região é criada uma vez e
+    reutilizada entre tokens — ver 6).
+
+R8. O workload decode é provavelmente limitado por BANDA DA RAM, não por FLOPs.
+    A lei de Amdahl sozinha não basta: encontrar o ponto de saturação
+    experimentalmente (ver 6).
+
+R9. Não alterar kernels AVX2 sem necessidade. Se for preciso um kernel aceitar
+    row_begin/row_end ou uma fusão, fazer a MENOR modificação possível (já
+    feito via os helpers por-range, que reusam dot_row_*_avx2).
+
+================================================================================
+2. NOVO forward() — ESTRUTURA EXATA
+================================================================================
+Pseudo-código (o forward() em src/model.cpp). Uma região paralela cobre o loop
+de camadas E o lm_head.
+
+  forward(token_id, pos, max_seq_len):
+    resize buffers (idempotente, uma vez)
+    get_embedding(x_, embd, token_id)         // serial, uma linha
+    partial_x = 0                             // somas de quadrados por thread
+    #pragma omp parallel
+    {
+      int tid = omp_get_thread_num();
+      int nth = omp_get_num_threads();
+      float partial[/*fase atual*/];           // local por thread
+
+      for (int l = 0; l < MODEL_LAYERS; ++l) {
+        const LayerWeights& layer = weights_.layers[l];
+        bool v_q6 = (layer.attn_v.type_str == "Q6_K");
+        bool dn_q6 = (layer.ffn_down.type_str == "Q6_K");
+
+        // ---- BLOCO ATENÇÃO ----
+        // F0: RMSNorm(attn). Entrada = x_ (embedding se l==0, senão saída da
+        //     fase down+residual da camada anterior, que já acumulou sumsq).
+        if (l == 0)
+            // primeira camada: computar sumsq(x_) aqui (sem partial herdado)
+            norm_from_scratch(x_norm_, x_, attn_norm);
+        else
+            // reduzir os N partials de x_ acumulados em partial_sumsq_[*]
+            norm_from_partials(x_norm_, x_, attn_norm, partial_sumsq_, nth);
+        // quantizar x_norm -> Q8_K (uma vez, reutilizado no QKV)
+        #pragma omp single
+            quantize_row_q8_K(x_norm_, x_norm_q8k_);
+        #pragma omp barrier                    // q8k pronto para todos
+
+        // F1: QKV fundido (q,k Q4_K; v Q4_K|Q6_K) — paralelo por range
+        int q_rows = MODEL_DIM, kv_rows = MODEL_KV_HEADS*head_dim;
+        int total = q_rows + 2*kv_rows;
+        int b = total*tid/nth, e = total*(tid+1)/nth;
+        qkv_range(q,w,k,v, x_norm_q8k_, b, e, q_rows, kv_rows, MODEL_DIM, v_q6);
+        #pragma omp barrier                    // q,k,v completos p/ atenção
+
+        // F2: RoPE + Atenção (pequena) — single thread
+        #pragma omp single
+            { apply_rope(...); execute_attention(attn_out_temp_, ...); }
+        #pragma omp barrier                    // attn_out pronto
+
+        // F3: o_proj + residual fundido (+ partial sumsq p/ ffn_norm)
+        //     entrada = attn_out_temp_ (FP32) -> quantizar UMA vez -> Q8_K
+        #pragma omp single
+            quantize_row_q8_K(attn_out_temp_, attn_out_q8k_);
+        #pragma omp barrier
+        residual = x_;                          // (cópia)
+        // o_proj é Q4_K em todas as camadas
+        gemv_residual_range(o_proj, attn_out_q8k_, x_, residual,
+                            0, MODEL_DIM, /*is_q6=*/false, &partial[tid]);
+        #pragma omp barrier                    // x_ novo completo + partials
+
+        // ---- BLOCO FFN ----
+        // F4: RMSNorm(ffn) a partir dos partials de x_ (fase F3)
+        norm_from_partials(x_norm_, x_, ffn_norm, partial_sumsq_, nth);
+        #pragma omp single
+            quantize_row_q8_K(x_norm_, x_norm_q8k_);   // reusa buffer Q8_K
+        #pragma omp barrier
+
+        // F5: gate + up + SwiGLU fundido -> ffn_intermediate_ (SEM gate[]/up[])
+        int fr = MODEL_FFN_DIM;
+        int fb = fr*tid/nth, fe = fr*(tid+1)/nth;
+        gate_up_swiglu_range(gate,up, x_norm_q8k_, ffn_intermediate_, fb, fe,
+                             MODEL_DIM);
+        #pragma omp barrier                    // ffn_intermediate completo
+
+        // F6: quantizar ffn_intermediate -> Q8_K (uma vez)
+        #pragma omp single
+            quantize_row_q8_K(ffn_intermediate_, ffn_intermediate_q8k_);
+        #pragma omp barrier
+
+        // F7: down + residual fundido (+ partial sumsq p/ attn_norm da camada
+        //     seguinte)
+        residual = x_;
+        gemv_residual_range(ffn_down, ffn_intermediate_q8k_, x_, residual,
+                            0, MODEL_DIM, dn_q6, &partial[tid]);
+        #pragma omp barrier                    // x_ final da camada
+      }
+
+      // ---- LM HEAD (dentro da MESMA região, para reaproveitar threads) ----
+      #pragma omp single
+        { norm_from_scratch(x_norm_, x_, output_norm);
+          quantize_row_q8_K(x_norm_, x_norm_q8k_); }
+      #pragma omp barrier
+      int lr = MODEL_VOCAB_SIZE;               // 130560 linhas, Q6_K
+      int lb = lr*tid/nth, le = lr*(tid+1)/nth;
+      gemv_q6_range(output, x_norm_q8k_, logits_, lb, le, MODEL_DIM);
+      // (lm_head não tem residual; sem partial sumsq)
+    }
+    return logits_;
+
+Observações de correção/determinismo:
+  * A cópia "residual = x_" acontece SEMPRE antes da fase de GEMV que sobrepõe
+    x_, e depois de uma barrier que garante x_ completo. Determinístico.
+  * partial_sumsq_ tem tamanho max_threads; cada thread escreve apenas em
+    [tid] e só a thread 0 (na #pragma omp single de norm) lê todos. Sem race.
+  * if(l==0) evita depender de partials na primeira camada (não há fase de
+    residual anterior).
+
+Buffers reutilizados (sem alocação por token):
+  * x_norm_q8k_ serve para o QKV, o o_proj (via attn_out_q8k_) e o lm_head.
+  * attn_out_q8k_ (novo) guarda o Q8_K da saída de atenção para o o_proj.
+  * ffn_intermediate_q8k_ guarda o Q8_K do intermediário do FFN.
+  * ffn_intermediate_ é escrito direto pelo helper fundido (sem gate_/up_).
+
+================================================================================
+3. HELPERS POR-RANGE (já existem; contrato)
+================================================================================
+Todos recebem (..., int row_begin, int row_end, ...) e NÃO contêm #pragma omp.
+A camada superior decide o range e as barriers.
+  - gemv_q4_range(w, xq, out, b, e, cols)
+  - gemv_q6_range(w, xq, out, b, e, cols)
+  - gemv_residual_range(w, xq, x, residual, b, e, cols, is_q6, partial*)
+      x[r]=residual[r]+dot; *partial = Σ x[r]² no range (o caller zera/consome)
+  - qkv_range(wq,wk,wv, xq, q,k,v, b, e, q_rows,kv_rows, cols, v_is_q6)
+  - gate_up_swiglu_range(wg,wu, xq, ffn, b, e, cols)   // ffn=silu(g)*u
+Verificar/ajustar:
+  * gemv_residual_range zera *partial (não acumula) — o caller soma os partials
+    de todos os threads no norm. Confirmar semântica de "overwrite vs +=".
+  * qkv_range já desacha v Q4_K|Q6_K internamente.
+  * stubs #else (não-AVX2) são incompletos (gate_up_swiglu_range zera a saída);
+    aceitável pois o alvo é AVX2, mas documentar como limitação.
+
+================================================================================
+4. CORREÇÃO / VERIFICAÇÃO NUMÉRICA (antes de aceitar qualquer ganho)
+================================================================================
+4.1. forward_legacy() = corpo do forward atual, verbatim (single-thread).
+4.2. verify(): para um (token,pos,context) idêntico, roda os dois caminhos e
+    compara MÁXIMO de |diff| em: Q, K, V, attn_out, saída o_proj (x após
+    atenção), ffn_intermediate, x após FFN (hidden), e logits.
+    Critério: diffs de ordem de FP (1e-3..1e-2 relativo) OK; divergência
+    grande = bug. NÃO aceitar throughput maior se logits estiverem errados.
+4.3. main --verify: carrega modelo, roda verify() em alguns tokens do prompt e
+    imprime a tabela de diffs. Só então habilita o benchmark.
+
+================================================================================
+5. INSTRUMENTAÇÃO (desligada por padrão; ausente da build Release final)
+================================================================================
+Guardada por do_profile_ (set_profiling(true) via --profile):
+  - phase_sec_[9], phase_work_sec_[9], phase_wait_sec_[9]
+      fases: 0=norm_attn 1=qkv 2=attention 3=o_proj 4=norm_ffn
+             5=gate_up_swiglu 6=quant_ffn 7=down 8=lm_head
+    * phase_sec_  = tempo de parede da fase (t_end - t_begin)
+    * phase_work_ = tempo em que a thread 0 TRABALHOU na fase (seu range)
+    * phase_wait_ = phase_sec_ - phase_work_  (tempo esperando na barrier)
+  - region_sec_ = tempo de parede do fork→join da região (por token)
+  - medir com omp_get_wtime() (ou std::chrono) APENAS na thread 0, e o
+    "work" da thread 0 no seu range; para work por thread opcional (array
+    per-thread) — opcional, só se pedido.
+  - report_profile(): imprime por fase: parede/work/wait/ms, em ms/token
+    (dividir por tokens_counted_) e o fechamento: Σ fases ≈ forward.
+  - main separa forward de sampling:
+      forward_ms/token = (tempo total de forward dos tokens) / n
+      sampling_ms/token = (tempo total do sample_token) / n
+      tok/s = 1000 / (forward_ms + sampling_ms)
+  "O tempo total das fases deve aprox. fechar com o tempo do forward."
+
+================================================================================
+6. BENCHMARK E ESCALABILIDADE
+================================================================================
+6.1. Matriz obrigatória: threads = 1 2 3 4 5 6 7 8 12 16 (1-8 = núcleos
+    físicos; 12/16 = SMT). Não assumir que 16 SMT > 8 físicos.
+6.2. Variáveis OpenMP a testar/gravar:
+      OMP_DYNAMIC=false
+      OMP_PROC_BIND=close
+      OMP_PLACES=cores
+      (e registrar se OMP_PROC_BIND=spread é melhor)
+6.3. Métricas por ponto: ms/token (forward), tok/s (incl. e excl. sampling),
+    e (com --profile) a tabela por fase + work/wait.
+6.4. Após CADA passo do roadmap (abaixo) mostrar:
+      antes / depois / speedup / threads / ms/token / tok/s.
+    Não fazer todas as otimizações num commit sem benchmarks intermediários.
+6.5. Encontre o PONTO DE SATURAÇÃO (bandwidth da RAM): o gráfico threads→
+    tok/s deve plateau; identificar a partir de quantas threads deixa de
+    melhorar. Conclusão medida: OpenMP/sincronização vs. compute vs. bandwidth.
+
+================================================================================
+7. ROADMAP EM 10 PASSOS (com checkpoint de benchmark após cada um)
+================================================================================
+PASSO 1 — Baseline + correção
+    Compila o estado atual (single-thread), corrige o bug de model.h (0.1),
+    adiciona <cmath> em ops_avx2.cpp (0.3). Medir baseline: ms/token, tok/s,
+    --verify (fused vs legacy idêntico pois fused ainda não existe → usar
+    legacy como referência). Checkpoint 1.
+PASSO 2 — gate+up+SwiGLU em UMA fase
+    Usar gate_up_swiglu_range no forward (F5). Remover gate_/up_ e o loop
+    separado de SwiGLU e a fase de quantização separada (quant passa a ser F6).
+    --verify vs legacy (compara ffn_intermediate). Checkpoint 2.
+PASSO 3 — down+residual (+ partial sumsq)  e  o_proj+residual (+ partials)
+    Usar gemv_residual_range (F3 e F7) + norm_from_partials nos norms.
+    --verify vs legacy (compara hidden após atenção e após FFN). Checkpoint 3.
+PASSO 4 — Região OpenMP persistente
+    Envelopar loop de camadas + lm_head num único #pragma omp parallel com
+    divisão manual estática e barriers (estrutura da seção 2). --verify deve
+    permanecer dentro da tolerância. Checkpoint 4.
+PASSO 5 — LM head paralelo (130560 linhas, Q6_K, estático contíguo)
+    gemv_q6_range dentro da mesma região. Medir scaling 1..16 SÓ do lm_head.
+    Checkpoint 5.
+PASSO 6 — QKV (e, opcional, QKV+RoPE fundido)
+    qkv_range (F1) na região; avaliar fundir RoPE (F-d) apenas se não
+    complicar demais. Checkpoint 6.
+PASSO 7 — o_proj: confirmar caminho (já Q8_K/Q4_K) e, se houver qualquer
+    resíduo FP32, migrar p/ quantizar-uma-vez + GEMV quantizado.
+    NÃO mudar precisão/formato silenciosamente — documentar o que foi feito.
+    Checkpoint 7.
+PASSO 8 — nowait onde estiver provado correto (apenas se o benchmark mostrar
+    que a barrier excede o ganho; cada nowait exige justificação de
+    dependência). Checkpoint 8.
+PASSO 9 — Scaling completo 1..16 + config de bind/places (6.2/6.3).
+    Tabela final. Identificar saturação. Checkpoint 9.
+PASSO 10 — SOMENTE ENTÃO considerar tasks/dynamic/sophisticated, e só se o
+    passo 9 mostrar desequilíbrio não resolvido por static.
+
+================================================================================
+8. ENTREGÁVEIS FINAIS (ao concluir)
+================================================================================
+  1. Código compilável (MSVC Release, /O2 /fp:fast /arch:AVX2, -openmp).
+  2. Descrição das alterações e de cada fusão/barrier.
+  3. Lista de barriers REMOVIDAS (pela fusão) e as que PERMANECEM + por quê.
+  4. Tabela de scaling por nº de threads (1..16) com ms/token e tok/s.
+  5. Throughput antes/depois.
+  6. Tabela de tempo por fase antes/depois (ms/token) + fechamento.
+  7. Validação numérica de logits (tabela de diffs de --verify).
+  8. Ponto de saturação de escalabilidade.
+  9. Conclusão medida: OpenMP/sincronização vs. compute vs. banda da RAM.
+  * Instrumentação pesada DESLIGADA na build Release final.
+  * Nenhum threadpool manual nesta tarefa.
+
+================================================================================
+RESUMO DAS DECISÕES-CHAVE
+================================================================================
+  * Uma região paralela persistente (não por-GEMV) + fusão de fases = menos
+    barriers globais e menos fork/join.
+  * Kernels dot/quant permanecem single-thread e por-range → portável.
+  * Static scheduling em ranges contíguos (localidade de memória).
+  * Q8_K "quantize once, reuse" preservado (atenção já faz isso; manter).
+  * Amdahl não basta: medir o plateau de bandwidth da RAM.
+  * Correção numérica (verify) é pré-condição de qualquer ganho.
+================================================================================

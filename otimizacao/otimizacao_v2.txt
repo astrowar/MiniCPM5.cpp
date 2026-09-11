@@ -1,0 +1,517 @@
+Esse resultado é bom: **3,21 → ~6 tok/s** confirma que o `Q4_K/Q6_K × Q8_K` era um gargalo real. Mas o perfil também mostra que ainda estamos longe do kernel que o `llama.cpp` executa.
+
+Há duas conclusões importantes.
+
+### 1. Não vale atacar Attention/RoPE primeiro
+
+Com 6 tok/s:
+
+```text
+tempo/token ≈ 166,7 ms
+```
+
+Se o GEMV realmente representa 86,9%:
+
+```text
+GEMV      ≈ 144,8 ms
+restante  ≈  21,8 ms
+```
+
+Para chegar aos 14 tok/s:
+
+```text
+71,4 ms/token
+```
+
+Então o GEMV teria que ficar em aproximadamente:
+
+```text
+71,4 - 21,8 = 49,6 ms
+
+144,8 / 49,6 ≈ 2,92x
+```
+
+Ou seja, aproximadamente:
+
+| melhoria do GEMV | desempenho teórico |
+| ---------------: | -----------------: |
+|            atual |          6,0 tok/s |
+|             1,5× |         ~8,4 tok/s |
+|             2,0× |        ~10,6 tok/s |
+|             2,5× |        ~12,5 tok/s |
+|             3,0× |        ~14,3 tok/s |
+
+Mesmo se Attention e RoPE virassem **custo zero**, você ficaria em só ~6,9 tok/s.
+
+Então agora está bem claro: **a batalha é GEMV**.
+
+---
+
+## 2. Achei mais diferenças importantes entre nosso kernel e o llama.cpp
+
+A V1 que te passei ainda fazia uma redução horizontal:
+
+```cpp
+hsum_i32_8(isum)
+```
+
+**a cada bloco de 256 pesos**.
+
+Isso é ruim.
+
+Por exemplo, `down_proj` tem:
+
+```text
+6144 / 256 = 24 blocos por row
+```
+
+Então cada row fazia 24 reduções horizontais.
+
+No `llama.cpp`, os resultados dos blocos continuam acumulados em registradores SIMD:
+
+```text
+block 0 ─┐
+block 1 ─┤
+block 2 ─┤ → __m256 accumulator → hsum UMA VEZ
+...      │
+block N ─┘
+```
+
+O código AVX2 atual do `llama.cpp` realmente mantém um acumulador `__m256`, converte o resultado inteiro de cada superblock e só faz a redução horizontal no final. 
+
+Além disso, no nosso Q6 V1 fazíamos:
+
+```text
+q6 unsigned 0..63
+      ↓
+subtract 32
+      ↓
+signed int8
+      ↓
+sign_epi8
+      ↓
+maddubs
+```
+
+Mas isso é desnecessário.
+
+O formato é:
+
+```text
+(q - 32) * scale
+```
+
+Então podemos calcular:
+
+```text
+q * x * scale
+```
+
+com `q` ainda unsigned e depois descontar:
+
+```text
+32 * scale * sum(x)
+```
+
+Os `bsums` do Q8_K já têm exatamente esses `sum(x)`.
+
+É justamente a estratégia usada atualmente no AVX2 do `llama.cpp`: ele calcula a correção de `-32` do Q6_K usando `bsums`, sem converter cada peso para signed antes do dot product. 
+
+---
+
+# Preparei uma V2
+
+Fiz essas alterações:
+
+```text
+Q4_K
+✓ hsum apenas 1× por row
+✓ acumulação SIMD através dos superblocks
+✓ FMA FP32 no acumulador
+✓ caminho F16C quando disponível
+✓ restrict nos hot pointers
+
+Q6_K
+✓ hsum apenas 1× por row
+✓ remove q -= 32
+✓ remove sign_epi8 por peso
+✓ usa Q8_K.bsums para corrigir -32
+✓ mantém q6 como unsigned 0..63
+✓ acumulação SIMD através dos superblocks
+✓ FMA no acumulador
+```
+
+Arquivo:
+
+[Baixar `ops_avx2_v2.cpp`](sandbox:/mnt/data/ops_avx2_v2.cpp)
+
+É substituição direta do `ops_avx2.cpp`.
+
+Eu compilei com:
+
+```bash
+g++ \
+  -std=c++17 \
+  -O3 \
+  -march=native \
+  -ffast-math \
+  -mavx2 \
+  -mfma \
+  -fopenmp
+```
+
+e passou.
+
+### Também validei numericamente V1 vs V2
+
+Com matrizes aleatórias grandes:
+
+```text
+Q4:
+max_abs = 0.005859
+max_rel = 8.18e-6
+
+Q6:
+max_abs = 0.019531
+max_rel = 3.91e-5
+```
+
+Essas diferenças são compatíveis com a mudança da ordem da acumulação floating-point:
+
+```text
+V1:
+block → hsum → float → soma
+
+V2:
+block ─┐
+block ─┤ SIMD float
+block ─┘ → hsum final
+```
+
+Não apareceu indicação de erro no unpack do Q6.
+
+---
+
+## Fiz também um microbenchmark V1 vs V2
+
+No ambiente onde estou executando, portanto **não use os números absolutos para comparar com seu notebook**, mas a diferença relativa é interessante.
+
+Com 1 thread:
+
+```text
+Q4 gate/up  6144 × 2048:
+V1  581 us
+V2  448 us
+→ 1.30×
+
+Q4 down 2048 × 6144:
+V1  580 us
+V2  452 us
+→ 1.28×
+
+Q6 LM head 130560 × 2048:
+V1  14725 us
+V2  10014 us
+→ 1.47×
+```
+
+Com mais threads, especialmente no LM head, o ganho cai porque começamos a entrar em território de **bandwidth de memória**.
+
+Isso é extremamente relevante para explicar os 14 tok/s do `llama.cpp`: depois de certo ponto, temos que otimizar também **como os pesos são percorridos e como as threads trabalham**, não apenas adicionar mais instruções SIMD.
+
+---
+
+# Mas encontrei uma inconsistência importante no seu profiler
+
+Você me passou:
+
+```text
+forward: 1372.4 us
+```
+
+Mas 6 tok/s significa:
+
+```text
+1 / 6 s
+= 0.1667 s
+= 166700 us/token
+```
+
+Então:
+
+```text
+1372 us/token
+```
+
+seria:
+
+```text
+~729 tok/s
+```
+
+Isso não pode ser o forward completo por token.
+
+Minha suspeita é que esses valores sejam algo como:
+
+```text
+média por layer
+```
+
+ou:
+
+```text
+média por chamada da categoria
+```
+
+e não soma real por token.
+
+Se for por layer:
+
+```text
+1372.4 us × 42
+≈ 57.6 ms
+```
+
+o que ainda corresponderia a ~17 tok/s, e não 6.
+
+Portanto há **tempo não contabilizado pelo profiler** ou a forma de calcular a média está errada.
+
+Isso agora merece atenção antes de tirarmos conclusões de percentuais.
+
+---
+
+# E encontrei um candidato fora do `forward`
+
+Sua medição de geração engloba:
+
+```cpp
+engine.forward(...);
+
+next_token = sample_token(...);
+```
+
+
+
+E seu `sample_token()` atualmente faz isto em **todo token**:
+
+```cpp
+std::vector<std::pair<float, int>> probs(vocab_size);
+```
+
+para:
+
+```text
+130560 logits
+```
+
+calcula `exp()` para todos e depois:
+
+```cpp
+std::sort(probs.begin(), probs.end(), ...)
+```
+
+dos **130.560 elementos** para implementar top-p. 
+
+Isso está fora do `engine.forward()`.
+
+Então seu:
+
+```text
+6 tok/s
+```
+
+inclui:
+
+```text
+forward
++ softmax de 130560
++ allocation
++ 130560 exp()
++ sort de 130560 pares
++ sampling
++ decode
++ cout + flush
+```
+
+enquanto o perfil que você mostrou aparentemente mede somente partes do forward.
+
+Não acho que o sampler explique sozinho 6 → 14, mas agora precisamos separar isso.
+
+---
+
+## Faça este teste junto com a V2
+
+Temporariamente, na geração, troque:
+
+```cpp
+next_token = sample_token(logits, 1.0f, 0.95f);
+```
+
+por:
+
+```cpp
+next_token = static_cast<int>(
+    std::max_element(logits.begin(), logits.end()) - logits.begin()
+);
+```
+
+Não é para mudar definitivamente o sampling; é só benchmark.
+
+Rode:
+
+```text
+100 tokens
+```
+
+e compare:
+
+```text
+V1 + top-p
+V2 + top-p
+
+V1 + argmax
+V2 + argmax
+```
+
+Isso vai separar imediatamente:
+
+```text
+kernel/model
+```
+
+de:
+
+```text
+sampler
+```
+
+---
+
+# E eu mediria `forward()` externamente
+
+Algo assim:
+
+```cpp
+double forward_ms = 0.0;
+double sample_ms  = 0.0;
+
+for (...) {
+    auto t0 = std::chrono::steady_clock::now();
+
+    const auto& logits =
+        engine.forward(next_token, current_pos, context_size);
+
+    auto t1 = std::chrono::steady_clock::now();
+
+    next_token = sample_token(logits, 1.0f, 0.95f);
+
+    auto t2 = std::chrono::steady_clock::now();
+
+    forward_ms +=
+        std::chrono::duration<double, std::milli>(
+            t1 - t0
+        ).count();
+
+    sample_ms +=
+        std::chrono::duration<double, std::milli>(
+            t2 - t1
+        ).count();
+}
+```
+
+Para 6 tok/s, espero que:
+
+```text
+forward_ms/token
++
+sample_ms/token
++
+I/O
+≈ 166.7 ms
+```
+
+Isso vai nos dizer onde estão os **~165 ms reais**, em vez dos atuais `1372 us`.
+
+---
+
+# Depois da V2, a próxima otimização que eu faria é mais estrutural
+
+Hoje temos:
+
+```text
+RMSNorm x
+   ↓
+
+q_proj:
+x FP32 → Q8_K → GEMV
+
+k_proj:
+x FP32 → Q8_K → GEMV
+
+v_proj:
+x FP32 → Q8_K → GEMV
+```
+
+Estamos quantizando **a mesma `x_norm_` três vezes**.
+
+E depois:
+
+```text
+gate_proj:
+x_norm FP32 → Q8_K → GEMV
+
+up_proj:
+x_norm FP32 → Q8_K → GEMV
+```
+
+quantizamos a mesma ativação duas vezes.
+
+O ideal é:
+
+```text
+                 ┌── q_proj
+x_norm → Q8_K ───┼── k_proj
+                 └── v_proj
+```
+
+e:
+
+```text
+                 ┌── gate_proj
+x_norm → Q8_K ───┤
+                 └── up_proj
+```
+
+Assim, em cada layer:
+
+```text
+5 quantizações
+↓
+2 quantizações
+```
+
+Mas existe algo ainda mais importante depois disso: **eliminar as centenas de regiões OpenMP independentes por token e usar workers persistentes**. Seu `forward()` chama `matmul()` sete vezes por layer e ainda abre OpenMP para residual/SwiGLU/norms; são 42 layers. O `llama.cpp` tem uma infraestrutura CPU bem mais sofisticada que apenas um `#pragma omp parallel for` por operação. Seu código atual mostra essas regiões independentes diretamente no hot path. 
+
+A ordem que eu seguiria agora é:
+
+1. **Testar `ops_avx2_v2.cpp`.**
+2. Medir `forward` e `sample` separadamente.
+3. Testar sampling por `argmax`.
+4. Testar `OMP_NUM_THREADS=1,2,4,6,8...` usando só núcleos físicos.
+5. Reutilizar Q8_K entre Q/K/V e entre gate/up.
+6. Depois atacar o modelo de threading/threadpool.
+7. Só então RoPE + attention.
+
+O resultado que eu mais quero ver agora é algo neste formato:
+
+```text
+threads = ?
+V1 top-p:    6.0 tok/s
+V2 top-p:    ? tok/s
+V2 argmax:   ? tok/s
+
+forward:     ? ms/token
+sampling:    ? ms/token
+```
+
+Com esses cinco números dá para dizer com bastante precisão se o próximo salto vem do **kernel**, da **banda de RAM**, do **OpenMP** ou do **sampler**.

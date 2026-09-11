@@ -1,0 +1,211 @@
+A próxima otimização que eu faria é **agrupar os GEMVs que usam a mesma entrada Q8_K**, reduzindo ao mesmo tempo quantizações repetidas **e** regiões OpenMP.
+
+Hoje conceitualmente você está fazendo:
+
+```text
+x_norm
+  ├─ quantize Q8 → q_proj  → OpenMP
+  ├─ quantize Q8 → k_proj  → OpenMP
+  └─ quantize Q8 → v_proj  → OpenMP
+
+x_norm_ffn
+  ├─ quantize Q8 → gate_proj → OpenMP
+  └─ quantize Q8 → up_proj   → OpenMP
+```
+
+No código público atual, cada GEMV abre seu próprio `#pragma omp parallel for`, e `matmul()` despacha cada projeção individualmente. ([GitHub][1])
+
+Eu mudaria para:
+
+```text
+x_norm
+     ↓
+ quantize Q8  ← uma vez
+     ↓
+ ┌───┼────┐
+ Q   K    V
+ └───┴────┘
+  1 região OpenMP
+```
+
+e:
+
+```text
+x_norm_ffn
+     ↓
+ quantize Q8  ← uma vez
+     ↓
+ ┌──────┴──────┐
+ gate          up
+ └─────────────┘
+ 1 região OpenMP
+```
+
+### API que eu criaria
+
+Algo assim:
+
+```cpp
+void gemv_qkv_q8_K_avx2(
+    const char* wq,
+    const char* wk,
+    const char* wv,
+    const block_q8_K* xq,
+    float* q,
+    float* k,
+    float* v,
+    int q_rows,
+    int kv_rows,
+    int num_cols
+);
+```
+
+e:
+
+```cpp
+void gemv_gate_up_q8_K_avx2(
+    const char* w_gate,
+    const char* w_up,
+    const block_q8_K* xq,
+    float* gate,
+    float* up,
+    int num_rows,
+    int num_cols
+);
+```
+
+Dentro:
+
+```cpp
+#pragma omp parallel
+{
+    #pragma omp for nowait
+    for (int r = 0; r < q_rows; ++r)
+        q[r] = dot_q4_q8(...);
+
+    #pragma omp for nowait
+    for (int r = 0; r < kv_rows; ++r)
+        k[r] = dot_q4_q8(...);
+
+    #pragma omp for
+    for (int r = 0; r < kv_rows; ++r)
+        v[r] = dot_q4_q8(...);
+}
+```
+
+Para `gate/up`, melhor ainda:
+
+```cpp
+#pragma omp parallel for
+for (int r = 0; r < ffn_dim; ++r) {
+    gate[r] = dot_q4_q8(gate_weights, xq, r);
+    up[r]   = dot_q4_q8(up_weights,   xq, r);
+}
+```
+
+Esse último formato é interessante porque cada thread recebe:
+
+```text
+row r gate
+row r up
+```
+
+e permanece trabalhando sem entrar duas vezes no runtime OpenMP.
+
+### Mas há um detalhe importante
+
+**Reutilizar Q8 sozinho não dará um ganho enorme.** Quantizar 2048 floats é barato perto de ler dezenas de MB de pesos.
+
+O ganho relevante vem da combinação:
+
+```text
+Q8 compartilhado
++
+menos parallel regions
++
+menos barriers
++
+melhor scheduling
++
+mais trabalho por worker
+```
+
+Com 42 layers, você hoje tem centenas de chamadas GEMV/OpenMP por token. Seu código também abre OpenMP separadamente em outras operações, como RMSNorm e attention. ([GitHub][2])
+
+Eu esperaria algo na faixa de:
+
+```text
+6.0 tok/s
+   ↓
+~6.5–7.2 tok/s
+```
+
+dependendo bastante da CPU. Não espero que isso sozinho leve a 14 tok/s.
+
+---
+
+## Depois disso vem a otimização realmente grande
+
+A seguinte seria:
+
+**threadpool persistente / uma região paralela persistente durante todo o forward.**
+
+Em vez de:
+
+```text
+gemv
+  criar/disparar OpenMP
+  barrier
+
+gemv
+  criar/disparar OpenMP
+  barrier
+
+norm
+  OpenMP
+  barrier
+
+gemv
+  OpenMP
+  barrier
+...
+```
+
+teríamos:
+
+```text
+TOKEN
+┌───────────────────────────────────────────┐
+│ worker 0 ──────────────────────────────── │
+│ worker 1 ──────────────────────────────── │
+│ worker 2 ──────────────────────────────── │
+│ worker 3 ──────────────────────────────── │
+│                                           │
+│ QKV → attn → O → gate/up → down → ...    │
+└───────────────────────────────────────────┘
+```
+
+As threads continuam vivas.
+
+Esse é um passo arquitetural importante para se aproximar do `llama.cpp`.
+
+---
+
+## Minha ordem agora seria
+
+1. **Q8 uma vez + QKV agrupado + Gate/Up agrupado**
+2. **Threadpool persistente**
+3. Afinar Q4_K/Q6_K para a sua microarquitetura (`AVX-VNNI`, se houver)
+4. Prefetch / row scheduling / talvez weight repacking
+5. AVX2 na attention
+6. RoPE pré-computado
+7. sampler/top-p
+
+Eu **não atacaria RoPE agora**. Ele era só ~3% no seu perfil; mesmo tornando-o instantâneo, 6 tok/s praticamente não muda.
+
+E também não focaria attention ainda: os seus próprios números mostram que **~87% está nos GEMVs**. O próximo salto tem que continuar atacando esse caminho.
+
+Se quiser, eu posso fazer agora a próxima alteração completa: **`QKV fused + gate/up fused`, reutilizando o mesmo `block_q8_K` e uma única região OpenMP**, já adaptada ao `ops.cpp`/`ops_internal.h` que fizemos.
+
+[1]: https://github.com/astrowar/MiniCPM5.cpp/blob/main/src/ops_avx2.cpp "MiniCPM5.cpp/src/ops_avx2.cpp at main · astrowar/MiniCPM5.cpp · GitHub"
+[2]: https://github.com/astrowar/MiniCPM5.cpp/blob/main/src/ops.cpp "MiniCPM5.cpp/src/ops.cpp at main · astrowar/MiniCPM5.cpp · GitHub"
