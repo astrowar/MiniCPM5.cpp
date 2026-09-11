@@ -298,25 +298,25 @@ void Tokenizer::skip_gguf_value(std::ifstream& f, uint32_t type) {
 // ============================================================================
 
 std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool add_generation_prompt, bool enable_think) {
-    std::string prompt = "\001";
+    std::string prompt = "<s>";
     for (const auto& msg : messages) {
         if (msg.role == "system") {
-            prompt += "system\n" + msg.content + "\n";
+            prompt += "<|im_start|>system\n" + msg.content + "<|im_end|>\n";
         } else if (msg.role == "user") {
-            prompt += "user\n" + msg.content + "\n";
+            prompt += "<|im_start|>user\n" + msg.content + "<|im_end|>\n";
         } else if (msg.role == "assistant") {
             if (enable_think) {
-                prompt += "assistant\n\n\n\n" + msg.content + "\n";
+                prompt += "<|im_start|>assistant\n<|thought_begin|>\n" + msg.content + "<|im_end|>\n";
             } else {
-                prompt += "assistant\n" + msg.content + "\n";
+                prompt += "<|im_start|>assistant\n" + msg.content + "<|im_end|>\n";
             }
         }
     }
     if (add_generation_prompt) {
         if (enable_think) {
-            prompt += "assistant\n";
+            prompt += "<|im_start|>assistant\n<|thought_begin|>";
         } else {
-            prompt += "assistant\nNo think is needed for this response.\n\n\n";
+            prompt += "<|im_start|>assistant\n";
         }
     }
     return prompt;

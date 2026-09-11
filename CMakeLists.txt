@@ -15,7 +15,7 @@ endif()
 find_package(OpenMP)
 
 # Define the include directory
-include_directories(include)
+include_directories(include src)
 
 # Set base sources
 set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp)

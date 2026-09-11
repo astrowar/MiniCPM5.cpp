@@ -122,10 +122,8 @@ const std::vector<float>& MiniCPM5Engine::forward(int token_id, int pos, int max
         // --- BLOCO DE ATENÇÃO (GQA + RoPE) ---
         residual_ = x_;
 
-        rmsnorm(x_norm_, x_, layer.attn_norm);
-
         if (x_norm_q8k_.size() != MODEL_DIM / QK_K) x_norm_q8k_.resize(MODEL_DIM / QK_K);
-        quantize_row_q8_K(x_norm_.data(), MODEL_DIM, x_norm_q8k_.data());
+        rmsnorm_and_quantize_q8k(x_norm_q8k_.data(), x_, layer.attn_norm);
 
         matmul_qkv_q8k(q_, k_, v_, x_norm_q8k_.data(), MODEL_DIM, layer.attn_q, layer.attn_k, layer.attn_v);
 
@@ -148,19 +146,13 @@ const std::vector<float>& MiniCPM5Engine::forward(int token_id, int pos, int max
         // --- BLOCO FEED-FORWARD (SwiGLU) ---
         residual_ = x_;
 
-        rmsnorm(x_norm_, x_, layer.ffn_norm);
-
         if (x_norm_q8k_.size() != MODEL_DIM / QK_K) x_norm_q8k_.resize(MODEL_DIM / QK_K);
-        quantize_row_q8_K(x_norm_.data(), MODEL_DIM, x_norm_q8k_.data());
+        rmsnorm_and_quantize_q8k(x_norm_q8k_.data(), x_, layer.ffn_norm);
 
         matmul_gate_up_q8k(gate_, up_, x_norm_q8k_.data(), MODEL_DIM, layer.ffn_gate, layer.ffn_up);
 
-        for (int i = 0; i < MODEL_FFN_DIM; i++) {
-            ffn_intermediate_[i] = silu(gate_[i]) * up_[i];
-        }
-
         if (ffn_intermediate_q8k_.size() != MODEL_FFN_DIM / QK_K) ffn_intermediate_q8k_.resize(MODEL_FFN_DIM / QK_K);
-        quantize_row_q8_K(ffn_intermediate_.data(), MODEL_FFN_DIM, ffn_intermediate_q8k_.data());
+        swiglu_and_quantize_q8k(ffn_intermediate_q8k_.data(), gate_, up_);
 
         matmul_q8k(ffn_output_, ffn_intermediate_q8k_.data(), MODEL_FFN_DIM, layer.ffn_down);
 

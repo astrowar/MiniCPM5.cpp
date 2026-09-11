@@ -18,6 +18,10 @@ struct Tensor {
 float silu(float x);
 void rmsnorm(std::vector<float>& out, const std::vector<float>& x, const Tensor& weight_tensor, float eps = 1e-6f);
 
+// Operações fundidas de alta performance (otimização de sincronização e localidade de cache)
+void rmsnorm_and_quantize_q8k(block_q8_K* out_q8k, const std::vector<float>& x, const Tensor& weight_tensor, float eps = 1e-6f);
+void swiglu_and_quantize_q8k(block_q8_K* out_q8k, const std::vector<float>& gate, const std::vector<float>& up);
+
 // Rotary Position Embeddings (RoPE)
 void apply_rope(std::vector<float>& vec, int pos, int head_idx, int head_dim, float rope_base);
 

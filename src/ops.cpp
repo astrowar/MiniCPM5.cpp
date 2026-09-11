@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iostream>
 #include <cassert>
+#include <cstring>
 
 // ============================================================================
 // 2. KERNELS DE PRODUTO ESCALAR "ON-THE-FLY" (GEMV) MULTI-THREAD (OPENMP)
@@ -11,6 +12,7 @@
 // GEMV para Tensores Float32
 void gemv_f32(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const float* w = reinterpret_cast<const float*>(matrix_weights);
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         float row_sum = 0.0f;
         int row_offset = r * num_cols;
@@ -26,6 +28,7 @@ void gemv_q8_0(const char* matrix_weights, const float* x, float* out, int num_r
     const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(matrix_weights);
     int blocks_per_row = num_cols / QK8_0;
 
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         float row_sum = 0.0f;
         int row_block_offset = r * blocks_per_row;
@@ -49,6 +52,7 @@ void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, in
     const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         float sum1 = 0.0f;
         float sum2 = 0.0f;
@@ -100,6 +104,7 @@ void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, in
     const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         float sum1 = 0.0f;
         float sum2 = 0.0f;
@@ -470,5 +475,97 @@ void get_embedding(std::vector<float>& out, const Tensor& embd_tensor, int token
     } else {
         std::cerr << "[AVISO] get_embedding so foi implementado para Q4_K." << std::endl;
         std::fill(out.begin(), out.end(), 0.0f);
+    }
+}
+
+// Operações fundidas de alta performance para otimização de sincronização OpenMP e localidade de cache
+void rmsnorm_and_quantize_q8k(block_q8_K* out_q8k, const std::vector<float>& x, const Tensor& weight_tensor, float eps) {
+    int dim = x.size();
+    const float* w = reinterpret_cast<const float*>(weight_tensor.data_ptr);
+
+    // Compute sum of squares
+    float sum = 0.0f;
+    #pragma omp parallel for reduction(+:sum) schedule(static)
+    for (int i = 0; i < dim; i++) {
+        sum += x[i] * x[i];
+    }
+    float rms = 1.0f / std::sqrt(sum / dim + eps);
+
+    int num_blocks = dim / QK_K;
+    #pragma omp parallel for schedule(static)
+    for (int ib = 0; ib < num_blocks; ib++) {
+        const float* xb = x.data() + ib * QK_K;
+        const float* wb = w + ib * QK_K;
+        block_q8_K& dst = out_q8k[ib];
+
+        // 1. Compute rmsnorm on-the-fly for 256 elements
+        float local_x[QK_K];
+        float amax = 0.0f;
+        for (int i = 0; i < QK_K; ++i) {
+            local_x[i] = xb[i] * rms * wb[i];
+            amax = std::max(amax, std::fabs(local_x[i]));
+        }
+
+        // 2. Quantize on-the-fly
+        if (amax == 0.0f) {
+            dst.d = 0.0f;
+            std::memset(dst.qs, 0, QK_K);
+            std::memset(dst.bsums, 0, sizeof(dst.bsums));
+            continue;
+        }
+
+        dst.d = amax / 127.0f;
+        float mul = 127.0f / amax;
+
+        int32_t bsums[QK_K / 16] = {0};
+        for (int i = 0; i < QK_K; ++i) {
+            dst.qs[i] = (int8_t)std::max(-127.0f, std::min(127.0f, (float)std::lround(local_x[i] * mul)));
+            bsums[i / 16] += dst.qs[i];
+        }
+        for (int g = 0; g < QK_K / 16; ++g) {
+            dst.bsums[g] = (int16_t)bsums[g];
+        }
+    }
+}
+
+void swiglu_and_quantize_q8k(block_q8_K* out_q8k, const std::vector<float>& gate, const std::vector<float>& up) {
+    int dim = gate.size();
+    int num_blocks = dim / QK_K;
+
+    #pragma omp parallel for schedule(static)
+    for (int ib = 0; ib < num_blocks; ib++) {
+        const float* gb = gate.data() + ib * QK_K;
+        const float* ub = up.data() + ib * QK_K;
+        block_q8_K& dst = out_q8k[ib];
+
+        // 1. SwiGLU on-the-fly
+        float local_x[QK_K];
+        float amax = 0.0f;
+        for (int i = 0; i < QK_K; ++i) {
+            float g = gb[i];
+            float silu_g = g / (1.0f + std::exp(-g));
+            local_x[i] = silu_g * ub[i];
+            amax = std::max(amax, std::fabs(local_x[i]));
+        }
+
+        // 2. Quantize on-the-fly
+        if (amax == 0.0f) {
+            dst.d = 0.0f;
+            std::memset(dst.qs, 0, QK_K);
+            std::memset(dst.bsums, 0, sizeof(dst.bsums));
+            continue;
+        }
+
+        dst.d = amax / 127.0f;
+        float mul = 127.0f / amax;
+
+        int32_t bsums[QK_K / 16] = {0};
+        for (int i = 0; i < QK_K; ++i) {
+            dst.qs[i] = (int8_t)std::max(-127.0f, std::min(127.0f, (float)std::lround(local_x[i] * mul)));
+            bsums[i / 16] += dst.qs[i];
+        }
+        for (int g = 0; g < QK_K / 16; ++g) {
+            dst.bsums[g] = (int16_t)bsums[g];
+        }
     }
 }
