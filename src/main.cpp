@@ -42,6 +42,125 @@ struct ModelWeights {
 };
 
 // ============================================================================
+// 1b. PROFILER HIERÁRQUICO
+// ============================================================================
+
+struct ProfileSection {
+    const char* name;
+    int depth;
+    long long ns_total = 0;
+    int count = 0;
+};
+
+struct HierarchicalProfiler {
+    bool enabled = false;
+    int warmup_tokens = 3; // ignora os primeiros N tokens (warmup)
+    int tokens_measured = 0;
+    std::vector<ProfileSection> sections;
+
+    void reset() {
+        for (auto& s : sections) { s.ns_total = 0; s.count = 0; }
+        tokens_measured = 0;
+    }
+
+    void begin_step() {
+        for (auto& s : sections) { s.ns_total = 0; s.count = 0; }
+    }
+
+    void record(const char* name, int depth, long long ns) {
+        if (!enabled) return;
+        for (auto& s : sections) {
+            if (s.name == name) { s.ns_total += ns; s.count++; return; }
+        }
+        // Seção não registrada ainda (não deveria acontecer, mas por segurança)
+        sections.push_back({name, depth, ns, 1});
+    }
+
+    long long total_ns() const {
+        // Usa a seção raiz (depth=0, "forward")
+        for (const auto& s : sections) {
+            if (s.depth == 0 && s.name == std::string("forward")) return s.ns_total;
+        }
+        return 0;
+    }
+
+    void print() const {
+        if (!enabled || tokens_measured == 0) return;
+        double div = static_cast<double>(tokens_measured);
+
+        std::cout << "\n" << std::string(60, '=') << std::endl;
+        std::cout << "  HIERARCHICAL PROFILE (averaged over " << tokens_measured << " tokens)" << std::endl;
+        std::cout << std::string(60, '=') << std::endl;
+
+        // Total
+        long long total = 0;
+        for (const auto& s : sections) {
+            if (s.depth == 0 && s.name == std::string("forward")) { total = s.ns_total; break; }
+        }
+        if (total == 0) return;
+
+        auto print_line = [&](const ProfileSection& s) {
+            double avg_us = (s.ns_total / div) / 1000.0;
+            double pct = (100.0 * s.ns_total) / total;
+            std::string indent = std::string(s.depth * 2, ' ');
+            std::cout << indent << s.name
+                      << ": " << std::fixed << std::setprecision(1) << avg_us
+                      << " us"
+                      << "  (" << std::setprecision(1) << pct << "%)" << std::endl;
+        };
+
+        print_line(sections[0]); // "forward"
+        for (size_t i = 1; i < sections.size(); ++i) {
+            print_line(sections[i]);
+        }
+
+        // Resumo por categoria
+        std::cout << "\n  --- Summary ---" << std::endl;
+        auto sum_range = [&](int d, const std::string& prefix) -> long long {
+            long long sum = 0;
+            for (const auto& s : sections) {
+                if (s.depth == d && std::string(s.name).rfind(prefix, 0) == 0) sum += s.ns_total;
+            }
+            return sum;
+        };
+
+        long long gemv_total = 0;
+        long long attn_total = 0;
+        long long norm_total = 0;
+        long long other_total = 0;
+
+        for (const auto& s : sections) {
+            std::string n(s.name);
+            if (n.find("proj") != std::string::npos || n == "lm_head" || n == "embedding") gemv_total += s.ns_total;
+            else if (n.find("attention") != std::string::npos || n.find("rope") != std::string::npos) attn_total += s.ns_total;
+            else if (n.find("norm") != std::string::npos || n.find("residual") != std::string::npos || n.find("swiglu") != std::string::npos) other_total += s.ns_total;
+            else if (n.find("rmsnorm") != std::string::npos) norm_total += s.ns_total;
+        }
+
+        auto print_pct = [&](const char* label, long long ns) {
+            double avg_us = (ns / div) / 1000.0;
+            double pct = (100.0 * ns) / total;
+            std::cout << "  " << std::left << std::setw(12) << label
+                      << std::right << std::setw(10) << std::fixed << std::setprecision(1) << avg_us
+                      << " us  " << std::setw(6) << std::setprecision(1) << pct << "%" << std::endl;
+        };
+
+        print_pct("GEMV/Proj", gemv_total);
+        print_pct("Attention", attn_total);
+        print_pct("Norms/Misc", other_total);
+
+        std::cout << std::string(60, '=') << std::endl;
+    }
+};
+
+// Global profiler instance
+static HierarchicalProfiler g_profile;
+static inline void prof_begin_end(const char* name, int depth, std::chrono::high_resolution_clock::time_point start) {
+    auto end = std::chrono::high_resolution_clock::now();
+    g_profile.record(name, depth, std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+// ============================================================================
 // 2. TOKENIZADOR E DETOKENIZADOR (Conversão Texto <-> IDs)
 // ============================================================================
 
@@ -513,11 +632,11 @@ public:
         if (x_.size() != MODEL_DIM) x_.resize(MODEL_DIM);
         if (x_norm_.size() != MODEL_DIM) x_norm_.resize(MODEL_DIM);
         if (q_.size() != MODEL_DIM) q_.resize(MODEL_DIM);
-        
+
         int kv_len = MODEL_KV_HEADS * (MODEL_DIM / MODEL_HEADS);
         if (k_.size() != kv_len) k_.resize(kv_len);
         if (v_.size() != kv_len) v_.resize(kv_len);
-        
+
         if (attn_out_temp_.size() != MODEL_DIM) attn_out_temp_.resize(MODEL_DIM);
         if (attn_output_.size() != MODEL_DIM) attn_output_.resize(MODEL_DIM);
         if (gate_.size() != MODEL_FFN_DIM) gate_.resize(MODEL_FFN_DIM);
@@ -526,78 +645,104 @@ public:
         if (ffn_output_.size() != MODEL_DIM) ffn_output_.resize(MODEL_DIM);
         if (residual_.size() != MODEL_DIM) residual_.resize(MODEL_DIM);
 
-        // 1. TOKEN EMBEDDING LOOKUP
-        // Lookup (Extraindo os 2048 valores da matriz token_embd em Q4_K)
-        get_embedding(x_, weights_.token_embd, token_id);
+        const bool prof = g_profile.enabled;
+        auto t_fwd = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
-        // 2. ITERAÇÃO DE CAMADAS TRANSFORME (42 CAMADAS)
+        // 1. TOKEN EMBEDDING LOOKUP
+        auto t0 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+        get_embedding(x_, weights_.token_embd, token_id);
+        if (prof) prof_begin_end("embedding", 1, t0);
+
+        // 2. ITERAÇÃO DE CAMADAS TRANSFORME
         for (int l = 0; l < MODEL_LAYERS; l++) {
             const LayerWeights& layer = weights_.layers[l];
-            
+
             // --- BLOCO DE ATENÇÃO (GQA + RoPE) ---
-            residual_ = x_; // Salva resíduo da Atenção (Sem alocação heap!)
+            residual_ = x_;
 
-            // RMSNorm antes da atenção
+            auto t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             rmsnorm(x_norm_, x_, layer.attn_norm);
+            if (prof) prof_begin_end("attn_rmsnorm", 2, t1);
 
-            // Projeções Q, K, V
-            matmul(q_, x_norm_, layer.attn_q);
-            matmul(k_, x_norm_, layer.attn_k);
-            matmul(v_, x_norm_, layer.attn_v);
+            if (x_norm_q8k_.size() != MODEL_DIM / QK_K) x_norm_q8k_.resize(MODEL_DIM / QK_K);
+            quantize_row_q8_K(x_norm_.data(), MODEL_DIM, x_norm_q8k_.data());
 
-            // Aplica os embeddings rotacionais RoPE
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+            matmul_qkv_q8k(q_, k_, v_, x_norm_q8k_.data(), MODEL_DIM, layer.attn_q, layer.attn_k, layer.attn_v);
+            if (prof) prof_begin_end("qkv_fused", 2, t1);
+
             int head_dim = MODEL_DIM / MODEL_HEADS;
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             for (int h = 0; h < MODEL_HEADS; h++) {
                 apply_rope(q_, pos, h, head_dim, MODEL_ROPE_BASE);
             }
             for (int h = 0; h < MODEL_KV_HEADS; h++) {
                 apply_rope(k_, pos, h, head_dim, MODEL_ROPE_BASE);
             }
+            if (prof) prof_begin_end("rope", 2, t1);
 
-            // Atenção GQA com KV Cache
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             execute_attention(attn_out_temp_, q_, k_, v_, kv_caches_[l], pos, max_seq_len, MODEL_HEADS, MODEL_KV_HEADS, head_dim);
+            if (prof) prof_begin_end("attention", 2, t1);
 
-            // Projeção de saída da atenção
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             matmul(attn_output_, attn_out_temp_, layer.attn_output);
+            if (prof) prof_begin_end("o_proj", 2, t1);
 
-            // Conexão Residual da Atenção
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x_[i] = residual_[i] + attn_output_[i];
             }
+            if (prof) prof_begin_end("attn_residual", 2, t1);
 
             // --- BLOCO FEED-FORWARD (SwiGLU) ---
-            residual_ = x_; // Salva resíduo da FFN (Sem alocação heap!)
+            residual_ = x_;
 
-            // RMSNorm antes da FFN
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             rmsnorm(x_norm_, x_, layer.ffn_norm);
+            if (prof) prof_begin_end("ffn_rmsnorm", 2, t1);
 
-            // Projeções Gate e Up do SwiGLU
-            matmul(gate_, x_norm_, layer.ffn_gate);
-            matmul(up_, x_norm_, layer.ffn_up);
+            if (x_norm_q8k_.size() != MODEL_DIM / QK_K) x_norm_q8k_.resize(MODEL_DIM / QK_K);
+            quantize_row_q8_K(x_norm_.data(), MODEL_DIM, x_norm_q8k_.data());
 
-            // Ativação SwiGLU: silu(gate) * up
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+            matmul_gate_up_q8k(gate_, up_, x_norm_q8k_.data(), MODEL_DIM, layer.ffn_gate, layer.ffn_up);
+            if (prof) prof_begin_end("gate_up_fused", 2, t1);
+
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             #pragma omp parallel for
             for (int i = 0; i < MODEL_FFN_DIM; i++) {
                 ffn_intermediate_[i] = silu(gate_[i]) * up_[i];
             }
+            if (prof) prof_begin_end("swiglu", 2, t1);
 
-            // Down projection
-            matmul(ffn_output_, ffn_intermediate_, layer.ffn_down);
+            if (ffn_intermediate_q8k_.size() != MODEL_FFN_DIM / QK_K) ffn_intermediate_q8k_.resize(MODEL_FFN_DIM / QK_K);
+            quantize_row_q8_K(ffn_intermediate_.data(), MODEL_FFN_DIM, ffn_intermediate_q8k_.data());
 
-            // Conexão Residual da FFN
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+            matmul_q8k(ffn_output_, ffn_intermediate_q8k_.data(), MODEL_FFN_DIM, layer.ffn_down);
+            if (prof) prof_begin_end("down_proj", 2, t1);
+
+            t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
             #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x_[i] = residual_[i] + ffn_output_[i];
             }
+            if (prof) prof_begin_end("ffn_residual", 2, t1);
         }
 
         // 3. FINAL NORMALIZATION
+        auto t2 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
         rmsnorm(x_norm_, x_, weights_.output_norm);
+        if (prof) prof_begin_end("output_norm", 1, t2);
 
         // 4. LANGUAGE MODEL HEAD (LM HEAD) PROJECTION
+        t2 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
         matmul(logits_, x_norm_, weights_.output);
+        if (prof) prof_begin_end("lm_head", 1, t2);
 
+        if (prof) prof_begin_end("forward", 0, t_fwd);
         return logits_;
     }
 
@@ -620,6 +765,8 @@ private:
     std::vector<float> ffn_output_;
     std::vector<float> residual_;
     std::vector<float> logits_;
+    std::vector<block_q8_K> x_norm_q8k_;
+    std::vector<block_q8_K> ffn_intermediate_q8k_;
 };
 
 // ============================================================================
@@ -721,6 +868,7 @@ int main(int argc, char** argv) {
     int context_size = 8192;
     int max_gen_tokens = 1024;
     bool verbose = false;
+    bool profile_mode = false;
 
     // Parse options
     for (int i = 1; i < argc; i++) {
@@ -733,6 +881,7 @@ int main(int argc, char** argv) {
                       << "  -c <size>         Context size (default: 8192)\n"
                       << "  -n <count>        Max generation tokens (default: 1024)\n"
                       << "  --no-think        Disable <think> reasoning tag generation\n"
+                      << "  --profile         Show hierarchical performance profile after generation\n"
                       << "  -v, --verbose     Show detailed generation logs and progress\n"
                       << "  --help, -h        Show this help message\n";
             return 0;
@@ -748,6 +897,8 @@ int main(int argc, char** argv) {
             max_gen_tokens = std::stoi(argv[++i]);
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
+        } else if (arg == "--profile") {
+            profile_mode = true;
         }
     }
 
@@ -858,9 +1009,42 @@ int main(int argc, char** argv) {
     int current_pos = prompt_tokens.size();
     int num_generated = 0;
 
+    // Ativa profiler se solicitado
+    if (profile_mode) {
+        g_profile.enabled = true;
+        g_profile.warmup_tokens = 3;
+        g_profile.sections.clear();
+        // Pre-registra seções (garante ordem fixa na saída)
+        g_profile.sections.push_back({"forward", 0, 0, 0});
+        g_profile.sections.push_back({"embedding", 1, 0, 0});
+        g_profile.sections.push_back({"attn_rmsnorm", 2, 0, 0});
+        g_profile.sections.push_back({"q_proj", 2, 0, 0});
+        g_profile.sections.push_back({"k_proj", 2, 0, 0});
+        g_profile.sections.push_back({"v_proj", 2, 0, 0});
+        g_profile.sections.push_back({"rope", 2, 0, 0});
+        g_profile.sections.push_back({"attention", 2, 0, 0});
+        g_profile.sections.push_back({"o_proj", 2, 0, 0});
+        g_profile.sections.push_back({"attn_residual", 2, 0, 0});
+        g_profile.sections.push_back({"ffn_rmsnorm", 2, 0, 0});
+        g_profile.sections.push_back({"gate_proj", 2, 0, 0});
+        g_profile.sections.push_back({"up_proj", 2, 0, 0});
+        g_profile.sections.push_back({"swiglu", 2, 0, 0});
+        g_profile.sections.push_back({"down_proj", 2, 0, 0});
+        g_profile.sections.push_back({"ffn_residual", 2, 0, 0});
+        g_profile.sections.push_back({"output_norm", 1, 0, 0});
+        g_profile.sections.push_back({"lm_head", 1, 0, 0});
+        std::cout << "\n[Profile] Hierarchical profiler ativo (warmup=" << g_profile.warmup_tokens << " tokens)..." << std::endl;
+    }
+
     if (verbose) std::cout << "\n[Inference] Starting autoregressive generation (max " << max_gen_tokens << " tokens)..." << std::endl;
     auto t_start_gen = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < max_gen_tokens && !stop_after_prompt; step++) {
+        // Profiler: após warmup, zera contadores e mede
+        if (profile_mode) {
+            if (step >= g_profile.warmup_tokens) {
+                g_profile.begin_step();
+            }
+        }
         const std::vector<float>& logits = engine.forward(next_token, current_pos, context_size);
 
         next_token = sample_token(logits, 1.0f, 0.95f);
@@ -873,6 +1057,11 @@ int main(int argc, char** argv) {
         num_generated++;
         std::string decoded = tokenizer.decode(next_token);
         std::cout << decoded << std::flush;
+
+        // Profiler: conta tokens medidos (após warmup)
+        if (profile_mode && step >= g_profile.warmup_tokens) {
+            g_profile.tokens_measured++;
+        }
 
         if (step == max_gen_tokens - 1) {
             if (verbose) std::cout << "\n[Stop] Max tokens (" << max_gen_tokens << ") reached." << std::endl;
@@ -898,6 +1087,11 @@ int main(int argc, char** argv) {
                   << "  " << num_generated << " tokens em "
                   << std::setprecision(2) << gen_time.count() << "s"
                   << "  →  " << gen_tok_s << " tok/s" << std::endl;
+    }
+
+    // Imprime perfil hierárquico
+    if (profile_mode) {
+        g_profile.print();
     }
 
     return 0;

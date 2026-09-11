@@ -210,6 +210,104 @@ void matmul(std::vector<float>& output, const std::vector<float>& input, const T
     }
 }
 
+void quantize_row_q8_K(const float* x, int n, block_q8_K* y) {
+#if defined(__AVX2__)
+    quantize_row_q8_K_avx2(x, y, n);
+#else
+    for (int ib = 0; ib < n / QK_K; ++ib) {
+        const float* xb = x + ib * QK_K;
+        block_q8_K& dst = y[ib];
+        float amax = 0.0f;
+        for (int i = 0; i < QK_K; ++i) amax = std::max(amax, std::fabs(xb[i]));
+        if (amax == 0.0f) { dst.d = 0.0f; std::memset(dst.qs, 0, QK_K); std::memset(dst.bsums, 0, sizeof(dst.bsums)); continue; }
+        dst.d = amax / 127.0f;
+        float mul = 127.0f / amax;
+        for (int i = 0; i < QK_K; ++i) dst.qs[i] = (int8_t)std::max(-127.0f, std::min(127.0f, (float)std::lround(xb[i] * mul)));
+        for (int g = 0; g < QK_K / 16; ++g) {
+            int32_t s = 0;
+            for (int i = 0; i < 16; ++i) s += dst.qs[g * 16 + i];
+            dst.bsums[g] = (int16_t)s;
+        }
+    }
+#endif
+}
+
+void matmul_q8k(std::vector<float>& output, const block_q8_K* input_q8k, int num_cols, const Tensor& tensor) {
+    uint64_t num_rows = tensor.dims.size() > 1 ? tensor.dims[1] : 1;
+    if (output.size() != num_rows) {
+        output.resize(num_rows);
+    }
+#if defined(__AVX2__)
+    if (tensor.type_str == "Q4_K") {
+        gemv_q4_K_q8_K_avx2(tensor.data_ptr, input_q8k, output.data(), num_rows, num_cols);
+    } else if (tensor.type_str == "Q6_K") {
+        gemv_q6_K_q8_K_avx2(tensor.data_ptr, input_q8k, output.data(), num_rows, num_cols);
+    } else
+#endif
+    {
+        static bool warned = false;
+        if (!warned) {
+            std::cout << "[AVISO] matmul_q8k: tipo " << tensor.type_str << " nao suportado." << std::endl;
+            warned = true;
+        }
+        std::fill(output.begin(), output.end(), 0.0f);
+    }
+}
+
+void matmul_qkv_q8k(std::vector<float>& q, std::vector<float>& k, std::vector<float>& v,
+                    const block_q8_K* input_q8k, int num_cols,
+                    const Tensor& tensor_q, const Tensor& tensor_k, const Tensor& tensor_v) {
+    const int q_rows = static_cast<int>(tensor_q.dims.size() > 1 ? tensor_q.dims[1] : 1);
+    const int kv_rows = static_cast<int>(tensor_k.dims.size() > 1 ? tensor_k.dims[1] : 1);
+    if (q.size() != q_rows) q.resize(q_rows);
+    if (k.size() != kv_rows) k.resize(kv_rows);
+    if (v.size() != kv_rows) v.resize(kv_rows);
+
+#if defined(__AVX2__)
+    if (tensor_v.type_str == "Q4_K") {
+        gemv_qkv_q4_K_q8_K_avx2(tensor_q.data_ptr, tensor_k.data_ptr, tensor_v.data_ptr,
+                                 input_q8k, q.data(), k.data(), v.data(), q_rows, kv_rows, num_cols);
+    } else if (tensor_v.type_str == "Q6_K") {
+        gemv_qkv_q4_q4_q6_q8_K_avx2(tensor_q.data_ptr, tensor_k.data_ptr, tensor_v.data_ptr,
+                                     input_q8k, q.data(), k.data(), v.data(), q_rows, kv_rows, num_cols);
+    } else
+#endif
+    {
+        static bool warned = false;
+        if (!warned) {
+            std::cout << "[AVISO] matmul_qkv_q8k: tipo v=" << tensor_v.type_str << " nao suportado." << std::endl;
+            warned = true;
+        }
+        std::fill(q.begin(), q.end(), 0.0f);
+        std::fill(k.begin(), k.end(), 0.0f);
+        std::fill(v.begin(), v.end(), 0.0f);
+    }
+}
+
+void matmul_gate_up_q8k(std::vector<float>& gate, std::vector<float>& up,
+                        const block_q8_K* input_q8k, int num_cols,
+                        const Tensor& tensor_gate, const Tensor& tensor_up) {
+    const int num_rows = static_cast<int>(tensor_gate.dims.size() > 1 ? tensor_gate.dims[1] : 1);
+    if (gate.size() != num_rows) gate.resize(num_rows);
+    if (up.size() != num_rows) up.resize(num_rows);
+
+#if defined(__AVX2__)
+    if (tensor_gate.type_str == "Q4_K" && tensor_up.type_str == "Q4_K") {
+        gemv_gate_up_q4_K_q8_K_avx2(tensor_gate.data_ptr, tensor_up.data_ptr,
+                                     input_q8k, gate.data(), up.data(), num_rows, num_cols);
+    } else
+#endif
+    {
+        static bool warned = false;
+        if (!warned) {
+            std::cout << "[AVISO] matmul_gate_up_q8k: tipos nao suportados." << std::endl;
+            warned = true;
+        }
+        std::fill(gate.begin(), gate.end(), 0.0f);
+        std::fill(up.begin(), up.end(), 0.0f);
+    }
+}
+
 float silu(float x) {
     return x / (1.0f + std::exp(-x));
 }

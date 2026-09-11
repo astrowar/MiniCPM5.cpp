@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include "ops_internal.h"
 
 // Estrutura Base de um Tensor
 struct Tensor {
@@ -23,6 +24,22 @@ void apply_rope(std::vector<float>& vec, int pos, int head_idx, int head_dim, fl
 // Multiplicação de Matrizes (GEMV) - Faz o dispatch automático com base no `type_str` do Tensor
 // Suporta descompactação on-the-fly para Q4_K, Q8_0, Q6_K e F32
 void matmul(std::vector<float>& output, const std::vector<float>& input, const Tensor& tensor);
+
+// Quantiza uma linha FP32 para Q8_K (usada para reutilizar a quantização entre projeções)
+void quantize_row_q8_K(const float* x, int n, block_q8_K* y);
+
+// GEMV com entrada já quantizada Q8_K (pula a quantização interna)
+void matmul_q8k(std::vector<float>& output, const block_q8_K* input_q8k, int num_cols, const Tensor& tensor);
+
+// GEMVs fundidos: QKV em uma unica regiao OpenMP
+void matmul_qkv_q8k(std::vector<float>& q, std::vector<float>& k, std::vector<float>& v,
+                    const block_q8_K* input_q8k, int num_cols,
+                    const Tensor& tensor_q, const Tensor& tensor_k, const Tensor& tensor_v);
+
+// GEMVs fundidos: Gate+Up em uma unica regiao OpenMP
+void matmul_gate_up_q8k(std::vector<float>& gate, std::vector<float>& up,
+                        const block_q8_K* input_q8k, int num_cols,
+                        const Tensor& tensor_gate, const Tensor& tensor_up);
 
 // Extração de linha de Embeddings
 void get_embedding(std::vector<float>& out, const Tensor& embd_tensor, int token_id);
