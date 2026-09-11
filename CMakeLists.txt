@@ -24,15 +24,28 @@ set(SIMD_FLAGS "")
 # Architecture-specific AVX2 detection
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i686|i386|x86)")
     include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-    check_cxx_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
-    if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
-        list(APPEND SOURCES src/ops_avx2.cpp)
-        set(SIMD_FLAGS "-mavx2" "-mfma")
-        message(STATUS "x86 Architecture detected with AVX2/FMA support. Enabling ops_avx2.cpp.")
-        add_compile_definitions(__AVX2__) # Força a flag de macro no pre-processador
+    if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        # MSVC: /arch:AVX2 habilita AVX2+FMA simultaneamente
+        check_cxx_compiler_flag("/arch:AVX2" COMPILER_SUPPORTS_AVX2)
+        if(COMPILER_SUPPORTS_AVX2)
+            list(APPEND SOURCES src/ops_avx2.cpp)
+            set(SIMD_FLAGS "/arch:AVX2")
+            message(STATUS "MSVC: AVX2/FMA supported. Enabling ops_avx2.cpp.")
+            add_compile_definitions(__AVX2__)
+        else()
+            message(STATUS "MSVC: AVX2 not supported by this compiler version.")
+        endif()
     else()
-        message(STATUS "x86 Architecture detected, but AVX2/FMA not supported by compiler.")
+        check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+        check_cxx_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
+        if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+            list(APPEND SOURCES src/ops_avx2.cpp)
+            set(SIMD_FLAGS "-mavx2" "-mfma")
+            message(STATUS "x86 Architecture detected with AVX2/FMA support. Enabling ops_avx2.cpp.")
+            add_compile_definitions(__AVX2__) # Força a flag de macro no pre-processador
+        else()
+            message(STATUS "x86 Architecture detected, but AVX2/FMA not supported by compiler.")
+        endif()
     endif()
 else()
     message(STATUS "Non-x86 architecture detected (${CMAKE_SYSTEM_PROCESSOR}). Disabling AVX2 support.")
@@ -41,10 +54,11 @@ endif()
 # Define the executable and its source files
 add_executable(minicpm_engine ${SOURCES})
 
-# Compiler flags for optimization (GCC/Clang)
+# Compiler flags for optimization
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # Enable high optimization, native architecture tuning, and conditionally enabled AVX2 & FMA extensions
     target_compile_options(minicpm_engine PRIVATE -O3 -march=native -ffast-math ${SIMD_FLAGS})
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+    target_compile_options(minicpm_engine PRIVATE /O2 /fp:fast /arch:AVX2 ${SIMD_FLAGS})
 endif()
 
 # Link OpenMP if found

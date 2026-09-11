@@ -881,20 +881,23 @@ int main(int argc, char** argv) {
     auto t_end_gen = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> gen_time = t_end_gen - t_start_gen;
 
+    double prompt_tok_s = (prompt_time.count() > 0) ? (prompt_tokens.size() / prompt_time.count()) : 0.0;
+    double gen_tok_s    = (gen_time.count() > 0) ? (num_generated / gen_time.count()) : 0.0;
+
     if (verbose) {
         std::cout << "\n\n=== Performance Summary ===" << std::endl;
-        double prompt_tok_s = (prompt_time.count() > 0) ? (prompt_tokens.size() / prompt_time.count()) : 0.0;
-        double gen_tok_s    = (gen_time.count() > 0) ? (num_generated / gen_time.count()) : 0.0;
         std::cout << "Prompt phase: " << prompt_tokens.size() << " tokens in "
                   << std::fixed << std::setprecision(2) << prompt_time.count() << " s"
                   << " (" << std::setprecision(1) << prompt_tok_s << " tok/s)" << std::endl;
         std::cout << "Generation:   " << num_generated << " tokens in "
                   << std::fixed << std::setprecision(2) << gen_time.count() << " s"
                   << " (" << std::setprecision(1) << gen_tok_s << " tok/s)" << std::endl;
-
         std::cout << "\n=== Engine Ready ===" << std::endl;
     } else {
-        std::cout << std::endl;
+        std::cout << "\n" << std::fixed << std::setprecision(1)
+                  << "  " << num_generated << " tokens em "
+                  << std::setprecision(2) << gen_time.count() << "s"
+                  << "  →  " << gen_tok_s << " tok/s" << std::endl;
     }
 
     return 0;
