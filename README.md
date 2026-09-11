@@ -91,12 +91,21 @@ Because LLM generation is **memory bandwidth bound** at batch size 1, keeping we
 
 Linking OpenMP parallelization achieves nearly linear speedup scaling across CPU cores:
 
-| Threads (`OMP_NUM_THREADS`) | Prompt Eval Speed | Token Generation Speed | Performance Boost |
-| :---: | :---: | :---: | :---: |
-| **1 Thread** | 1.69 tok/s | 1.71 tok/s | Baseline ($1.0\times$) |
-| **4 Threads** | **6.46 tok/s** | **5.92 tok/s** | **~3.5x Speedup** |
+### x86_64 (AVX2 / AMD Ryzen 7 4750U Mobile)
+| Threads (`OMP_NUM_THREADS`) | Token Generation Speed |
+|-----------------------------|------------------------|
+| **1 Thread**                | ~9.2 tok/s             |
+| **4 Threads**               | **~27.3 tok/s**        |
+| **8 Threads**               | ~21.2 tok/s (RAM Saturated) |
 
-*Note: Benchmarked on standard x86_64 consumer CPUs. Actual performance will vary based on CPU architecture, memory bandwidth, and model size.*
+### ARM AArch64 (NEON / Raspberry Pi 4 - 4GB)
+| Threads (`OMP_NUM_THREADS`) | Token Generation Speed |
+|-----------------------------|------------------------|
+| **1 Thread**                | ~0.50 tok/s            |
+| **2 Threads**               | ~0.97 tok/s            |
+| **4 Threads**               | **~1.76 tok/s**        |
+
+For detailed architectural information on ARM compilation, read [ARM_NEON.md](ARM_NEON.md). For broader scalar fallback details, check the internal documentation.
 
 ---
 
