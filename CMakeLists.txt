@@ -18,7 +18,7 @@ find_package(OpenMP)
 include_directories(include)
 
 # Set base sources
-set(SOURCES src/main.cpp src/ops.cpp)
+set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp)
 set(SIMD_FLAGS "")
 
 # Architecture-specific AVX2 detection
