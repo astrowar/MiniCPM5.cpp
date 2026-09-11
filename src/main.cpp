@@ -690,7 +690,6 @@ public:
             if (prof) prof_begin_end("o_proj", 2, t1);
 
             t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-            #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x_[i] = residual_[i] + attn_output_[i];
             }
@@ -711,7 +710,6 @@ public:
             if (prof) prof_begin_end("gate_up_fused", 2, t1);
 
             t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-            #pragma omp parallel for
             for (int i = 0; i < MODEL_FFN_DIM; i++) {
                 ffn_intermediate_[i] = silu(gate_[i]) * up_[i];
             }
@@ -725,7 +723,6 @@ public:
             if (prof) prof_begin_end("down_proj", 2, t1);
 
             t1 = prof ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-            #pragma omp parallel for
             for (int i = 0; i < MODEL_DIM; i++) {
                 x_[i] = residual_[i] + ffn_output_[i];
             }

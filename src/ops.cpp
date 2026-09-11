@@ -3,7 +3,6 @@
 #include <cmath>
 #include <iostream>
 #include <cassert>
-#include <omp.h>
 
 // ============================================================================
 // 2. KERNELS DE PRODUTO ESCALAR "ON-THE-FLY" (GEMV) MULTI-THREAD (OPENMP)
@@ -12,7 +11,6 @@
 // GEMV para Tensores Float32
 void gemv_f32(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const float* w = reinterpret_cast<const float*>(matrix_weights);
-    #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
         float row_sum = 0.0f;
         int row_offset = r * num_cols;
@@ -28,7 +26,6 @@ void gemv_q8_0(const char* matrix_weights, const float* x, float* out, int num_r
     const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(matrix_weights);
     int blocks_per_row = num_cols / QK8_0;
 
-    #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
         float row_sum = 0.0f;
         int row_block_offset = r * blocks_per_row;
@@ -52,7 +49,6 @@ void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, in
     const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
-    #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
         float sum1 = 0.0f;
         float sum2 = 0.0f;
@@ -104,7 +100,6 @@ void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, in
     const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
-    #pragma omp parallel for
     for (int r = 0; r < num_rows; ++r) {
         float sum1 = 0.0f;
         float sum2 = 0.0f;
@@ -322,7 +317,6 @@ void rmsnorm(std::vector<float>& out, const std::vector<float>& x, const Tensor&
     float rms = 1.0f / std::sqrt(sum / dim + eps);
     if (out.size() != dim) out.resize(dim);
     
-    #pragma omp parallel for
     for (int i = 0; i < dim; i++) {
         out[i] = x[i] * rms * w[i];
     }
@@ -378,7 +372,6 @@ void execute_attention(std::vector<float>& attn_out,
 
     std::vector<float> all_scores(num_heads * (pos + 1));
 
-    #pragma omp parallel for
     for (int h = 0; h < num_heads; ++h) {
         int kv_h = h / num_queries_per_kv;
         const float* q_h = q.data() + h * head_dim;

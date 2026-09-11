@@ -1,5 +1,4 @@
 #include "ops_internal.h"
-#include <omp.h>
 #include <cassert>
 #include <cstring>
 #include <vector>
@@ -222,7 +221,6 @@ void gemv_q4_K_q8_K_avx2(const char* RESTRICT matrix_weights, const block_q8_K* 
     assert(num_cols % QK_K == 0);
     const block_q4_K* RESTRICT blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
     const int nb = num_cols / QK_K;
-#pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         out[r] = dot_row_q4_K_q8_K_avx2(blocks + static_cast<size_t>(r)*nb, xq, nb);
     }
@@ -233,7 +231,6 @@ void gemv_q6_K_q8_K_avx2(const char* RESTRICT matrix_weights, const block_q8_K* 
     assert(num_cols % QK_K == 0);
     const block_q6_K* RESTRICT blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
     const int nb = num_cols / QK_K;
-#pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         out[r] = dot_row_q6_K_q8_K_avx2(blocks + static_cast<size_t>(r)*nb, xq, nb);
     }
@@ -251,7 +248,6 @@ void gemv_qkv_q4_K_q8_K_avx2(const char* wq, const char* wk, const char* wv,
     const int nb = num_cols / QK_K;
     const int total = q_rows + kv_rows + kv_rows;
 
-    #pragma omp parallel for schedule(static)
     for (int r = 0; r < total; ++r) {
         if (r < q_rows) {
             q[r] = dot_row_q4_K_q8_K_avx2(bq + static_cast<size_t>(r)*nb, xq, nb);
@@ -277,7 +273,6 @@ void gemv_qkv_q4_q4_q6_q8_K_avx2(const char* wq, const char* wk, const char* wv,
     const int nb = num_cols / QK_K;
     const int total = q_rows + kv_rows + kv_rows;
 
-    #pragma omp parallel for schedule(static)
     for (int r = 0; r < total; ++r) {
         if (r < q_rows) {
             q[r] = dot_row_q4_K_q8_K_avx2(bq + static_cast<size_t>(r)*nb, xq, nb);
@@ -374,7 +369,6 @@ void gemv_gate_up_q4_K_q8_K_avx2(const char* w_gate, const char* w_up,
     const block_q4_K* bu = reinterpret_cast<const block_q4_K*>(w_up);
     const int nb = num_cols / QK_K;
 
-    #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
         float g, u;
         dot_row_gate_up_q4_K_q8_K_avx2(bg + static_cast<size_t>(r)*nb, bu + static_cast<size_t>(r)*nb, xq, nb, g, u);
