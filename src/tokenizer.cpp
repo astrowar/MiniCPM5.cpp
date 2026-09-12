@@ -306,7 +306,7 @@ std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool a
             prompt += "<|im_start|>user\n" + msg.content + "<|im_end|>\n";
         } else if (msg.role == "assistant") {
             if (enable_think) {
-                prompt += "<|im_start|>assistant\n<|thought_begin|>\n" + msg.content + "<|im_end|>\n";
+                prompt += "<|im_start|>assistant\n<think>\n" + msg.content + "\n</think><|im_end|>\n";
             } else {
                 prompt += "<|im_start|>assistant\n" + msg.content + "<|im_end|>\n";
             }
@@ -314,9 +314,9 @@ std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool a
     }
     if (add_generation_prompt) {
         if (enable_think) {
-            prompt += "<|im_start|>assistant\n<|thought_begin|>";
+            prompt += "<|im_start|>assistant\n/think\n";
         } else {
-            prompt += "<|im_start|>assistant\n";
+            prompt += "<|im_start|>assistant\n/no_think\n";
         }
     }
     return prompt;

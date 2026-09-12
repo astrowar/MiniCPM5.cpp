@@ -9,6 +9,7 @@
 #include <cmath>
 #include <random>
 #include <algorithm>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -96,7 +97,7 @@ int main(int argc, char** argv) {
 #endif
 
     std::string text_prompt = "O Brasil é um país";
-    bool enable_think = true;
+    bool enable_think = false;
     std::string model_path = "MiniCPM5-2B-Q4_K_M.gguf";
     int context_size = 8192;
     int max_gen_tokens = 1024;
@@ -111,12 +112,15 @@ int main(int argc, char** argv) {
                       << "  -m <path>         Path to GGUF model\n"
                       << "  -c <size>         Context size (default: 8192)\n"
                       << "  -n <count>        Max generation tokens (default: 1024)\n"
-                      << "  --no-think        Disable think tag generation\n"
+                      << "  --think           Enable think tag generation\n"
+                      << "  --no-think        Disable think tag generation (default)\n"
                       << "  -v, --verbose     Show detailed generation logs\n"
                       << "  --help, -h        Show this help message\n";
             return 0;
         } else if (arg == "--text" && i + 1 < argc) {
             text_prompt = argv[++i];
+        } else if (arg == "--think") {
+            enable_think = true;
         } else if (arg == "--no-think") {
             enable_think = false;
         } else if (arg == "-m" && i + 1 < argc) {
@@ -192,16 +196,55 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> prompt_tokens = tokenizer.tokenize(full_prompt);
+    if (prompt_tokens.empty()) {
+        std::cerr << "[Error] Prompt tokenization produced zero tokens." << std::endl;
+        return 1;
+    }
 
     if (verbose) {
         std::cout << "[Prompt] " << prompt_tokens.size() << " tokens." << std::endl;
         std::cout << "\n[Output] ";
     }
 
-    int next_token = -1;
-    auto is_stop_token = [](int token_id) {
-        return token_id == 1 || token_id == 2 || token_id == 130073;
+    std::unordered_set<int> stop_token_ids;
+    std::unordered_set<int> hidden_token_ids;
+    auto register_hidden_token = [&](const std::string& token_text) {
+        int token_id = tokenizer.get_id(token_text);
+        if (token_id >= 0) hidden_token_ids.insert(token_id);
     };
+    auto register_stop_token = [&](const std::string& token_text) {
+        int token_id = tokenizer.get_id(token_text);
+        if (token_id >= 0) stop_token_ids.insert(token_id);
+    };
+
+    register_stop_token("</s>");
+    register_stop_token("<|im_end|>");
+
+    register_hidden_token("<s>");
+    register_hidden_token("<|im_start|>");
+    register_hidden_token("<|im_sep|>");
+    register_hidden_token("<|thought_begin|>");
+    register_hidden_token("<|thought_end|>");
+    register_hidden_token("<think>");
+    register_hidden_token("</think>");
+    register_hidden_token("/think");
+    register_hidden_token("/no_think");
+
+    auto is_stop_token = [&](int token_id) {
+        return stop_token_ids.find(token_id) != stop_token_ids.end();
+    };
+
+    if (verbose) {
+        std::cout << "[Decode] Stop tokens:";
+        if (stop_token_ids.empty()) {
+            std::cout << " (none found in vocab)";
+        } else {
+            for (int id : stop_token_ids) std::cout << " " << id;
+        }
+        std::cout << std::endl;
+    }
+
+    int next_token = -1;
 
     // Prompt phase
     auto t_start_prompt = std::chrono::high_resolution_clock::now();
@@ -216,7 +259,7 @@ int main(int argc, char** argv) {
     std::chrono::duration<double> prompt_time = t_end_prompt - t_start_prompt;
 
     bool stop_after_prompt = is_stop_token(next_token);
-    if (!stop_after_prompt) {
+    if (!stop_after_prompt && hidden_token_ids.find(next_token) == hidden_token_ids.end()) {
         std::cout << tokenizer.decode(next_token) << std::flush;
     }
 
@@ -235,9 +278,11 @@ int main(int argc, char** argv) {
             break;
         }
 
-        num_generated++;
-        std::string decoded = tokenizer.decode(next_token);
-        std::cout << decoded << std::flush;
+        if (hidden_token_ids.find(next_token) == hidden_token_ids.end()) {
+            num_generated++;
+            std::string decoded = tokenizer.decode(next_token);
+            std::cout << decoded << std::flush;
+        }
     }
     auto t_end_gen = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> gen_time = t_end_gen - t_start_gen;
