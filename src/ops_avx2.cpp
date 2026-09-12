@@ -37,7 +37,10 @@ static inline float hmax_f32_8(__m256 v) {
 // Prefer hardware conversion when the native target exposes F16C.
 // The generic bit-manipulation conversion in ops_internal.h remains the fallback.
 static inline float fp16_to_fp32_hot(ggml_fp16_t h) {
-#if defined(__F16C__)
+#if defined(_MSC_VER)
+    const __m128i h16 = _mm_cvtsi32_si128(static_cast<int>(h));
+    return _mm_cvtss_f32(_mm_cvtph_ps(h16));
+#elif defined(__F16C__)
     return _cvtsh_ss(h);
 #else
     return fp16_to_fp32(h);
@@ -114,9 +117,7 @@ static inline float dot_row_q4_K_q8_K_avx2(
 
     for (int b = 0; b < nb; ++b) {
         uint8_t scales[8], mins[8];
-        for (int g = 0; g < 8; ++g) {
-            get_scale_min_k4(g, w[b].scales, &scales[g], &mins[g]);
-        }
+        decode_q4k_scales_mins(w[b].scales, scales, mins);
 
         __m256i isum = _mm256_setzero_si256();
         for (int j = 0; j < 4; ++j) {
@@ -147,15 +148,6 @@ static inline float dot_row_q4_K_q8_K_avx2(
     return hsum_f32_8(acc) + acc_min;
 }
 
-static inline __m256i scale_pair_i16_fast(int8_t s0, int8_t s1) {
-    const uint16_t u0 = static_cast<uint16_t>(static_cast<int16_t>(s0));
-    const uint16_t u1 = static_cast<uint16_t>(static_cast<int16_t>(s1));
-    const uint32_t p0 = static_cast<uint32_t>(u0) | (static_cast<uint32_t>(u0) << 16);
-    const uint32_t p1 = static_cast<uint32_t>(u1) | (static_cast<uint32_t>(u1) << 16);
-    return _mm256_setr_epi32(static_cast<int>(p0), static_cast<int>(p0), static_cast<int>(p0), static_cast<int>(p0),
-                             static_cast<int>(p1), static_cast<int>(p1), static_cast<int>(p1), static_cast<int>(p1));
-}
-
 // Q6_K row dot: keep reconstructed q in [0,63] so maddubs can consume it as
 // unsigned bytes. Correct the format's -32 offset once via Q8_K bsums, instead
 // of subtracting 32 and doing signed-byte sign fixups for every weight.
@@ -164,7 +156,22 @@ static inline float dot_row_q6_K_q8_K_avx2(
         const block_q8_K* RESTRICT a,
         int nb) {
     const __m256i m3  = _mm256_set1_epi8(3);
+    const __m256i m12 = _mm256_set1_epi8(12);
     const __m256i m15 = _mm256_set1_epi8(15);
+    const __m256i m48 = _mm256_set1_epi8(48);
+    const __m256i mc0 = _mm256_set1_epi8(static_cast<char>(0xC0));
+    const __m256i shuf01 = _mm256_setr_epi8(
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+         2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3);
+    const __m256i shuf23 = _mm256_setr_epi8(
+         4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,
+         6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7);
+    const __m256i shuf45 = _mm256_setr_epi8(
+         8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,
+        10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11);
+    const __m256i shuf67 = _mm256_setr_epi8(
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,
+        14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15);
     __m256 acc = _mm256_setzero_ps();
 
     for (int b = 0; b < nb; ++b) {
@@ -177,17 +184,22 @@ static inline float dot_row_q6_K_q8_K_avx2(
         for (int half = 0; half < 2; ++half) {
             const uint8_t* ql = w[b].ql + half*64;
             const uint8_t* qh = w[b].qh + half*32;
-            const int8_t* sc = w[b].scales + half*8;
             const int8_t* xq = a[b].qs + half*128;
+            const __m128i shalf = (half == 0) ? _mm256_castsi256_si128(sc16) : _mm256_extracti128_si256(sc16, 1);
+            const __m256i s = _mm256_broadcastsi128_si256(shalf);
+            const __m256i s01 = _mm256_shuffle_epi8(s, shuf01);
+            const __m256i s23 = _mm256_shuffle_epi8(s, shuf23);
+            const __m256i s45 = _mm256_shuffle_epi8(s, shuf45);
+            const __m256i s67 = _mm256_shuffle_epi8(s, shuf67);
 
             const __m256i lo0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 0));
             const __m256i lo1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
             const __m256i hb  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
 
             const __m256i q0 = _mm256_or_si256(_mm256_and_si256(lo0, m15), _mm256_slli_epi16(_mm256_and_si256(hb, m3), 4));
-            const __m256i q1 = _mm256_or_si256(_mm256_and_si256(lo1, m15), _mm256_slli_epi16(_mm256_and_si256(hb, _mm256_set1_epi8(12)), 2));
-            const __m256i q2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lo0, 4), m15), _mm256_and_si256(hb, _mm256_set1_epi8(48)));
-            const __m256i q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lo1, 4), m15), _mm256_srli_epi16(_mm256_and_si256(hb, _mm256_set1_epi8(static_cast<char>(0xC0))), 2));
+            const __m256i q1 = _mm256_or_si256(_mm256_and_si256(lo1, m15), _mm256_slli_epi16(_mm256_and_si256(hb, m12), 2));
+            const __m256i q2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lo0, 4), m15), _mm256_and_si256(hb, m48));
+            const __m256i q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lo1, 4), m15), _mm256_srli_epi16(_mm256_and_si256(hb, mc0), 2));
 
             const __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + 0));
             const __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + 32));
@@ -199,10 +211,10 @@ static inline float dot_row_q6_K_q8_K_avx2(
             __m256i p2 = _mm256_maddubs_epi16(q2, x2);
             __m256i p3 = _mm256_maddubs_epi16(q3, x3);
 
-            p0 = _mm256_madd_epi16(p0, scale_pair_i16_fast(sc[0], sc[1]));
-            p1 = _mm256_madd_epi16(p1, scale_pair_i16_fast(sc[2], sc[3]));
-            p2 = _mm256_madd_epi16(p2, scale_pair_i16_fast(sc[4], sc[5]));
-            p3 = _mm256_madd_epi16(p3, scale_pair_i16_fast(sc[6], sc[7]));
+            p0 = _mm256_madd_epi16(p0, s01);
+            p1 = _mm256_madd_epi16(p1, s23);
+            p2 = _mm256_madd_epi16(p2, s45);
+            p3 = _mm256_madd_epi16(p3, s67);
 
             isum = _mm256_add_epi32(isum, _mm256_add_epi32(p0, p1));
             isum = _mm256_add_epi32(isum, _mm256_add_epi32(p2, p3));
@@ -307,10 +319,8 @@ static inline void dot_row_gate_up_q4_K_q8_K_avx2(
     for (int b = 0; b < nb; ++b) {
         uint8_t scales_g[8], mins_g[8];
         uint8_t scales_u[8], mins_u[8];
-        for (int g = 0; g < 8; ++g) {
-            get_scale_min_k4(g, wg[b].scales, &scales_g[g], &mins_g[g]);
-            get_scale_min_k4(g, wu[b].scales, &scales_u[g], &mins_u[g]);
-        }
+        decode_q4k_scales_mins(wg[b].scales, scales_g, mins_g);
+        decode_q4k_scales_mins(wu[b].scales, scales_u, mins_u);
 
         __m256i isum_g = _mm256_setzero_si256();
         __m256i isum_u = _mm256_setzero_si256();
@@ -345,18 +355,14 @@ static inline void dot_row_gate_up_q4_K_q8_K_avx2(
         acc_g = _mm256_fmadd_ps(_mm256_set1_ps(d_g), _mm256_cvtepi32_ps(isum_g), acc_g);
         acc_u = _mm256_fmadd_ps(_mm256_set1_ps(d_u), _mm256_cvtepi32_ps(isum_u), acc_u);
 
-        int32_t minsum = 0;
-        for (int g = 0; g < 8; ++g) {
-            const int32_t sx = static_cast<int32_t>(a[b].bsums[2*g]) + static_cast<int32_t>(a[b].bsums[2*g + 1]);
-            minsum += static_cast<int32_t>(mins_g[g]) * sx;
-        }
-        acc_min_g -= a[b].d * fp16_to_fp32_hot(wg[b].dmin) * static_cast<float>(minsum);
-
+        int32_t minsum_g = 0;
         int32_t minsum_u = 0;
         for (int g = 0; g < 8; ++g) {
             const int32_t sx = static_cast<int32_t>(a[b].bsums[2*g]) + static_cast<int32_t>(a[b].bsums[2*g + 1]);
+            minsum_g += static_cast<int32_t>(mins_g[g]) * sx;
             minsum_u += static_cast<int32_t>(mins_u[g]) * sx;
         }
+        acc_min_g -= a[b].d * fp16_to_fp32_hot(wg[b].dmin) * static_cast<float>(minsum_g);
         acc_min_u -= a[b].d * fp16_to_fp32_hot(wu[b].dmin) * static_cast<float>(minsum_u);
     }
 

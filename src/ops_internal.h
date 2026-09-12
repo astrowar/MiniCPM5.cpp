@@ -66,6 +66,28 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t
     }
 }
 
+static inline void decode_q4k_scales_mins(const uint8_t* q, uint8_t* sc, uint8_t* mn) {
+    sc[0] = q[0] & 63;
+    sc[1] = q[1] & 63;
+    sc[2] = q[2] & 63;
+    sc[3] = q[3] & 63;
+
+    mn[0] = q[4] & 63;
+    mn[1] = q[5] & 63;
+    mn[2] = q[6] & 63;
+    mn[3] = q[7] & 63;
+
+    sc[4] = (q[8]  & 0x0F) | ((q[0] >> 6) << 4);
+    sc[5] = (q[9]  & 0x0F) | ((q[1] >> 6) << 4);
+    sc[6] = (q[10] & 0x0F) | ((q[2] >> 6) << 4);
+    sc[7] = (q[11] & 0x0F) | ((q[3] >> 6) << 4);
+
+    mn[4] = (q[8]  >> 4) | ((q[4] >> 6) << 4);
+    mn[5] = (q[9]  >> 4) | ((q[5] >> 6) << 4);
+    mn[6] = (q[10] >> 4) | ((q[6] >> 6) << 4);
+    mn[7] = (q[11] >> 4) | ((q[7] >> 6) << 4);
+}
+
 // Assinaturas das implementações de kernels de multiplicação de matrizes
 void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols);
 void gemv_q4_K_avx2(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols);

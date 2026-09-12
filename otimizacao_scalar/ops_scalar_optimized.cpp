@@ -138,9 +138,7 @@ float dot_row_q4_K_q8_K_scalar(
         // The Q4_K block stores 8 six-bit scales and 8 six-bit minima.
         uint8_t scales[8];
         uint8_t mins[8];
-        for (int g = 0; g < 8; ++g) {
-            get_scale_min_k4(g, wb.scales, &scales[g], &mins[g]);
-        }
+        decode_q4k_scales_mins(wb.scales, scales, mins);
 
         // Integer part of:
         //   sum_g scale[g] * sum_i(q4[i] * q8[i])
@@ -197,6 +195,88 @@ float dot_row_q4_K_q8_K_scalar(
     }
 
     return result;
+}
+
+void dot_row_gate_up_q4_K_q8_K_scalar(
+    const block_q4_K* w_gate,
+    const block_q4_K* w_up,
+    const block_q8_K* xq,
+    int num_blocks,
+    float& gate_out,
+    float& up_out) {
+
+    assert(w_gate != nullptr);
+    assert(w_up != nullptr);
+    assert(xq != nullptr);
+    assert(num_blocks > 0);
+
+    float gate_result = 0.0f;
+    float up_result = 0.0f;
+
+    for (int b = 0; b < num_blocks; ++b) {
+        const block_q4_K& wg = w_gate[b];
+        const block_q4_K& wu = w_up[b];
+        const block_q8_K& ab = xq[b];
+
+        uint8_t scales_g[8];
+        uint8_t mins_g[8];
+        uint8_t scales_u[8];
+        uint8_t mins_u[8];
+        decode_q4k_scales_mins(wg.scales, scales_g, mins_g);
+        decode_q4k_scales_mins(wu.scales, scales_u, mins_u);
+
+        int32_t weighted_dot_g = 0;
+        int32_t weighted_dot_u = 0;
+
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const uint8_t* packed_g = wg.qs + chunk * 32;
+            const uint8_t* packed_u = wu.qs + chunk * 32;
+            const int xbase = chunk * 64;
+
+            int32_t dot_lo_g = 0;
+            int32_t dot_hi_g = 0;
+            int32_t dot_lo_u = 0;
+            int32_t dot_hi_u = 0;
+
+            for (int i = 0; i < 32; ++i) {
+                const uint8_t byte_g = packed_g[i];
+                const uint8_t byte_u = packed_u[i];
+                const int32_t x_lo = static_cast<int32_t>(ab.qs[xbase + i]);
+                const int32_t x_hi = static_cast<int32_t>(ab.qs[xbase + 32 + i]);
+
+                dot_lo_g += static_cast<int32_t>(byte_g & 0x0F) * x_lo;
+                dot_hi_g += static_cast<int32_t>(byte_g >> 4) * x_hi;
+                dot_lo_u += static_cast<int32_t>(byte_u & 0x0F) * x_lo;
+                dot_hi_u += static_cast<int32_t>(byte_u >> 4) * x_hi;
+            }
+
+            weighted_dot_g += static_cast<int32_t>(scales_g[2 * chunk + 0]) * dot_lo_g;
+            weighted_dot_g += static_cast<int32_t>(scales_g[2 * chunk + 1]) * dot_hi_g;
+            weighted_dot_u += static_cast<int32_t>(scales_u[2 * chunk + 0]) * dot_lo_u;
+            weighted_dot_u += static_cast<int32_t>(scales_u[2 * chunk + 1]) * dot_hi_u;
+        }
+
+        int32_t min_dot_g = 0;
+        int32_t min_dot_u = 0;
+        for (int g = 0; g < 8; ++g) {
+            const int32_t sum_x =
+                static_cast<int32_t>(ab.bsums[2 * g + 0]) +
+                static_cast<int32_t>(ab.bsums[2 * g + 1]);
+            min_dot_g += static_cast<int32_t>(mins_g[g]) * sum_x;
+            min_dot_u += static_cast<int32_t>(mins_u[g]) * sum_x;
+        }
+
+        const float xd = ab.d;
+        gate_result += xd * (
+            fp16_to_fp32(wg.d) * static_cast<float>(weighted_dot_g) -
+            fp16_to_fp32(wg.dmin) * static_cast<float>(min_dot_g));
+        up_result += xd * (
+            fp16_to_fp32(wu.d) * static_cast<float>(weighted_dot_u) -
+            fp16_to_fp32(wu.dmin) * static_cast<float>(min_dot_u));
+    }
+
+    gate_out = gate_result;
+    up_out = up_result;
 }
 
 // =============================================================================
@@ -461,8 +541,20 @@ void project_gate_up_scalar(
     #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < w_gate.rows; ++r) {
-        gate[r] = dot_matrix_row_q8_scalar(w_gate, xq, r);
-        up[r]   = dot_matrix_row_q8_scalar(w_up,   xq, r);
+        if (w_gate.type == KQuantType::Q4_K && w_up.type == KQuantType::Q4_K) {
+            const auto* gate_blocks = reinterpret_cast<const block_q4_K*>(w_gate.data);
+            const auto* up_blocks = reinterpret_cast<const block_q4_K*>(w_up.data);
+            const int nb = x_size / QK_K;
+            dot_row_gate_up_q4_K_q8_K_scalar(
+                gate_blocks + static_cast<std::size_t>(r) * nb,
+                up_blocks + static_cast<std::size_t>(r) * nb,
+                xq,
+                nb,
+                gate[r],
+                up[r]);
+        } else {
+            gate[r] = dot_matrix_row_q8_scalar(w_gate, xq, r);
+            up[r]   = dot_matrix_row_q8_scalar(w_up,   xq, r);
+        }
     }
 }
-

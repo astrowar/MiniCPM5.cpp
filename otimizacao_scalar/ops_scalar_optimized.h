@@ -44,6 +44,14 @@ float dot_row_q4_K_q8_K_scalar(
     const block_q8_K* xq,
     int num_blocks);
 
+void dot_row_gate_up_q4_K_q8_K_scalar(
+    const block_q4_K* w_gate,
+    const block_q4_K* w_up,
+    const block_q8_K* xq,
+    int num_blocks,
+    float& gate_out,
+    float& up_out);
+
 float dot_row_q6_K_q8_K_scalar(
     const block_q6_K* w,
     const block_q8_K* xq,
@@ -115,4 +123,3 @@ void project_gate_up_scalar(
     float* gate,
     float* up,
     Q8KWorkspace& workspace);
-

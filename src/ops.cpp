@@ -64,18 +64,17 @@ void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, in
             float d = fp16_to_fp32(bloco.d);
             float dmin = fp16_to_fp32(bloco.dmin);
             int x_offset = sb * QK_K;
-            
-            int is = 0;
-            uint8_t sc, m;
+            uint8_t scales[8], mins[8];
+            decode_q4k_scales_mins(bloco.scales, scales, mins);
             const uint8_t* q = bloco.qs;
 
             // Processa em chunks de 64
-            for (int j = 0; j < QK_K; j += 64) {
-                get_scale_min_k4(is + 0, bloco.scales, &sc, &m);
-                float d1 = d * sc; float m1 = dmin * m;
-                
-                get_scale_min_k4(is + 1, bloco.scales, &sc, &m);
-                float d2 = d * sc; float m2 = dmin * m;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const int j = chunk * 64;
+                float d1 = d * static_cast<float>(scales[2 * chunk + 0]);
+                float m1 = dmin * static_cast<float>(mins[2 * chunk + 0]);
+                float d2 = d * static_cast<float>(scales[2 * chunk + 1]);
+                float m2 = dmin * static_cast<float>(mins[2 * chunk + 1]);
 
                 for (int l = 0; l < 32; ++l) {
                     float w1 = d1 * (q[l] & 0xF) - m1;
@@ -84,7 +83,6 @@ void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, in
                     sum2 += w2 * x[x_offset + j + l + 32];
                 }
                 q += 32;
-                is += 2;
             }
         }
         out[r] = sum1 + sum2;
@@ -384,8 +382,7 @@ void matmul_gate_up_q8k(std::vector<float>& gate, std::vector<float>& up,
             gate[r] = dot_row_q4_K_q8_K_neon(bg + r*nb, input_q8k, nb);
             up[r]   = dot_row_q4_K_q8_K_neon(bu + r*nb, input_q8k, nb);
 #else
-            gate[r] = dot_row_q4_K_q8_K_scalar(bg + r*nb, input_q8k, nb);
-            up[r]   = dot_row_q4_K_q8_K_scalar(bu + r*nb, input_q8k, nb);
+            dot_row_gate_up_q4_K_q8_K_scalar(bg + r*nb, bu + r*nb, input_q8k, nb, gate[r], up[r]);
 #endif
         }
     } else {
@@ -540,18 +537,17 @@ void get_embedding(std::vector<float>& out, const Tensor& embd_tensor, int token
             float d = fp16_to_fp32(bloco.d);
             float dmin = fp16_to_fp32(bloco.dmin);
             int x_offset = sb * QK_K;
-            
-            int is = 0;
-            uint8_t sc, m;
+            uint8_t scales[8], mins[8];
+            decode_q4k_scales_mins(bloco.scales, scales, mins);
             const uint8_t* q = bloco.qs;
 
             // Processa em chunks de 64 (mesma matemática da dequantização q4_k)
-            for (int j = 0; j < QK_K; j += 64) {
-                get_scale_min_k4(is + 0, bloco.scales, &sc, &m);
-                float d1 = d * sc; float m1 = dmin * m;
-                
-                get_scale_min_k4(is + 1, bloco.scales, &sc, &m);
-                float d2 = d * sc; float m2 = dmin * m;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const int j = chunk * 64;
+                float d1 = d * static_cast<float>(scales[2 * chunk + 0]);
+                float m1 = dmin * static_cast<float>(mins[2 * chunk + 0]);
+                float d2 = d * static_cast<float>(scales[2 * chunk + 1]);
+                float m2 = dmin * static_cast<float>(mins[2 * chunk + 1]);
 
                 for (int l = 0; l < 32; ++l) {
                     float w1 = d1 * (q[l] & 0xF) - m1;
@@ -560,7 +556,6 @@ void get_embedding(std::vector<float>& out, const Tensor& embd_tensor, int token
                     out[x_offset + j + l + 32] = w2;
                 }
                 q += 32;
-                is += 2;
             }
         }
     } else {
