@@ -1,4 +1,5 @@
 #include "model.h"
+#include "omp_config.h"
 #include "tokenizer.h"
 #include <iostream>
 #include <fstream>
@@ -102,6 +103,9 @@ int main(int argc, char** argv) {
     int context_size = 8192;
     int max_gen_tokens = 1024;
     bool verbose = false;
+    float temperature = 1.0f; // temperatura de sampling (facil de ajustar aqui)
+
+    omp_config::initialize(8);
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -208,9 +212,19 @@ int main(int argc, char** argv) {
 
     std::unordered_set<int> stop_token_ids;
     std::unordered_set<int> hidden_token_ids;
+    std::unordered_set<int> think_begin_token_ids;
+    std::unordered_set<int> think_end_token_ids;
     auto register_hidden_token = [&](const std::string& token_text) {
         int token_id = tokenizer.get_id(token_text);
         if (token_id >= 0) hidden_token_ids.insert(token_id);
+    };
+    auto register_think_begin_token = [&](const std::string& token_text) {
+        int token_id = tokenizer.get_id(token_text);
+        if (token_id >= 0) think_begin_token_ids.insert(token_id);
+    };
+    auto register_think_end_token = [&](const std::string& token_text) {
+        int token_id = tokenizer.get_id(token_text);
+        if (token_id >= 0) think_end_token_ids.insert(token_id);
     };
     auto register_stop_token = [&](const std::string& token_text) {
         int token_id = tokenizer.get_id(token_text);
@@ -230,8 +244,37 @@ int main(int argc, char** argv) {
     register_hidden_token("/think");
     register_hidden_token("/no_think");
 
+    register_think_begin_token("<|thought_begin|>");
+    register_think_begin_token("<think>");
+    register_think_begin_token("/think");
+    register_think_end_token("<|thought_end|>");
+    register_think_end_token("</think>");
+    register_think_end_token("/no_think");
+
     auto is_stop_token = [&](int token_id) {
         return stop_token_ids.find(token_id) != stop_token_ids.end();
+    };
+    bool in_thinking = false;
+    auto emit_token = [&](int token_id) {
+        if (think_begin_token_ids.find(token_id) != think_begin_token_ids.end()) {
+            if (!in_thinking) {
+                in_thinking = true;
+                std::cout << "\n[THINKING_BEGIN]\n" << std::flush;
+            }
+            return false;
+        }
+        if (think_end_token_ids.find(token_id) != think_end_token_ids.end()) {
+            if (in_thinking) {
+                in_thinking = false;
+                std::cout << "\n[THINKING_END]\n" << std::flush;
+            }
+            return false;
+        }
+        if (hidden_token_ids.find(token_id) != hidden_token_ids.end()) {
+            return false;
+        }
+        std::cout << tokenizer.decode(token_id) << std::flush;
+        return true;
     };
 
     if (verbose) {
@@ -252,15 +295,15 @@ int main(int argc, char** argv) {
         int token_id = prompt_tokens[pos];
         const std::vector<float>& logits = engine.forward(token_id, pos, context_size);
         if (pos == prompt_tokens.size() - 1) {
-            next_token = sample_token(logits, 1.0f, 0.95f);
+            next_token = sample_token(logits, temperature, 0.95f);
         }
     }
     auto t_end_prompt = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> prompt_time = t_end_prompt - t_start_prompt;
 
     bool stop_after_prompt = is_stop_token(next_token);
-    if (!stop_after_prompt && hidden_token_ids.find(next_token) == hidden_token_ids.end()) {
-        std::cout << tokenizer.decode(next_token) << std::flush;
+    if (!stop_after_prompt) {
+        emit_token(next_token);
     }
 
     // Autoregressive generation
@@ -270,7 +313,7 @@ int main(int argc, char** argv) {
     auto t_start_gen = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < max_gen_tokens && !stop_after_prompt; step++) {
         const std::vector<float>& logits = engine.forward(next_token, current_pos, context_size);
-        next_token = sample_token(logits, 1.0f, 0.95f);
+        next_token = sample_token(logits, temperature, 0.95f);
         current_pos++;
 
         if (is_stop_token(next_token)) {
@@ -278,10 +321,8 @@ int main(int argc, char** argv) {
             break;
         }
 
-        if (hidden_token_ids.find(next_token) == hidden_token_ids.end()) {
+        if (emit_token(next_token)) {
             num_generated++;
-            std::string decoded = tokenizer.decode(next_token);
-            std::cout << decoded << std::flush;
         }
     }
     auto t_end_gen = std::chrono::high_resolution_clock::now();
