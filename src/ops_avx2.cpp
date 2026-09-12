@@ -1,4 +1,5 @@
 #include "ops_internal.h"
+#include "thread_affinity.h"
 #include <cassert>
 #include <cstring>
 #include <vector>
@@ -235,6 +236,7 @@ void gemv_q4_K_q8_K_avx2(const char* RESTRICT matrix_weights, const block_q8_K* 
     const int nb = num_cols / QK_K;
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
+        cpu_affinity::pin_once();
         out[r] = dot_row_q4_K_q8_K_avx2(blocks + static_cast<size_t>(r)*nb, xq, nb);
     }
 }
@@ -246,6 +248,7 @@ void gemv_q6_K_q8_K_avx2(const char* RESTRICT matrix_weights, const block_q8_K* 
     const int nb = num_cols / QK_K;
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
+        cpu_affinity::pin_once();
         out[r] = dot_row_q6_K_q8_K_avx2(blocks + static_cast<size_t>(r)*nb, xq, nb);
     }
 }
@@ -264,6 +267,7 @@ void gemv_qkv_q4_K_q8_K_avx2(const char* wq, const char* wk, const char* wv,
 
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < total; ++r) {
+        cpu_affinity::pin_once();
         if (r < q_rows) {
             q[r] = dot_row_q4_K_q8_K_avx2(bq + static_cast<size_t>(r)*nb, xq, nb);
         } else if (r < q_rows + kv_rows) {
@@ -290,6 +294,7 @@ void gemv_qkv_q4_q4_q6_q8_K_avx2(const char* wq, const char* wk, const char* wv,
 
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < total; ++r) {
+        cpu_affinity::pin_once();
         if (r < q_rows) {
             q[r] = dot_row_q4_K_q8_K_avx2(bq + static_cast<size_t>(r)*nb, xq, nb);
         } else if (r < q_rows + kv_rows) {
@@ -381,6 +386,7 @@ void gemv_gate_up_q4_K_q8_K_avx2(const char* w_gate, const char* w_up,
 
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
+        cpu_affinity::pin_once();
         float g, u;
         dot_row_gate_up_q4_K_q8_K_avx2(bg + static_cast<size_t>(r)*nb, bu + static_cast<size_t>(r)*nb, xq, nb, g, u);
         gate[r] = g;
