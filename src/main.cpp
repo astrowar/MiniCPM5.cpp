@@ -303,6 +303,13 @@ int main(int argc, char** argv) {
 
     bool stop_after_prompt = is_stop_token(next_token);
     if (!stop_after_prompt) {
+        // The chat template already placed /think in the prompt, so the model
+        // starts generating thinking content directly without re-emitting a
+        // begin marker. Pre-enter thinking mode so the state machine is correct.
+        if (enable_think && !in_thinking) {
+            in_thinking = true;
+            std::cout << "\n[THINKING_BEGIN]\n" << std::flush;
+        }
         emit_token(next_token);
     }
 
