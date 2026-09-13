@@ -313,41 +313,49 @@ float dot_row_q6_K_q8_K_scalar(
             const uint8_t* qh = wb.qh + half * 32;
             const int8_t* sc  = wb.scales + half * 8;
             const int8_t* aq  = ab.qs + half * 128;
+            // Keep the same scale grouping as AVX2:
+            // l in [0..15] uses scales {0,2,4,6}; l in [16..31] uses {1,3,5,7}.
+            const int32_t s0a = static_cast<int32_t>(sc[0]);
+            const int32_t s1a = static_cast<int32_t>(sc[2]);
+            const int32_t s2a = static_cast<int32_t>(sc[4]);
+            const int32_t s3a = static_cast<int32_t>(sc[6]);
+            const int32_t s0b = static_cast<int32_t>(sc[1]);
+            const int32_t s1b = static_cast<int32_t>(sc[3]);
+            const int32_t s2b = static_cast<int32_t>(sc[5]);
+            const int32_t s3b = static_cast<int32_t>(sc[7]);
 
-            for (int l = 0; l < 32; ++l) {
-                // Four Q6 values are encoded together. This is exactly the same
-                // physical mapping as the original scalar GGUF decoder, except
-                // we intentionally do NOT subtract 32 here.
-                const uint8_t h = qh[l];
+            auto accumulate_l_range = [&](int l0, int l1, int32_t s0, int32_t s1, int32_t s2, int32_t s3) {
+                for (int l = l0; l < l1; ++l) {
+                    // Four Q6 values are encoded together. This is exactly the
+                    // same physical mapping as the original scalar GGUF decoder,
+                    // except we intentionally do NOT subtract 32 here.
+                    const uint8_t h = qh[l];
 
-                const int32_t q0 =
-                    static_cast<int32_t>(ql[l +  0] & 0x0F) |
-                    (static_cast<int32_t>((h >> 0) & 0x03) << 4);
+                    const int32_t q0 =
+                        static_cast<int32_t>(ql[l +  0] & 0x0F) |
+                        (static_cast<int32_t>((h >> 0) & 0x03) << 4);
 
-                const int32_t q1 =
-                    static_cast<int32_t>(ql[l + 32] & 0x0F) |
-                    (static_cast<int32_t>((h >> 2) & 0x03) << 4);
+                    const int32_t q1 =
+                        static_cast<int32_t>(ql[l + 32] & 0x0F) |
+                        (static_cast<int32_t>((h >> 2) & 0x03) << 4);
 
-                const int32_t q2 =
-                    static_cast<int32_t>(ql[l +  0] >> 4) |
-                    (static_cast<int32_t>((h >> 4) & 0x03) << 4);
+                    const int32_t q2 =
+                        static_cast<int32_t>(ql[l +  0] >> 4) |
+                        (static_cast<int32_t>((h >> 4) & 0x03) << 4);
 
-                const int32_t q3 =
-                    static_cast<int32_t>(ql[l + 32] >> 4) |
-                    (static_cast<int32_t>((h >> 6) & 0x03) << 4);
+                    const int32_t q3 =
+                        static_cast<int32_t>(ql[l + 32] >> 4) |
+                        (static_cast<int32_t>((h >> 6) & 0x03) << 4);
 
-                // Each scale covers 16 consecutive logical weights.
-                const int parity = (l >= 16) ? 1 : 0;
-                const int32_t s0 = static_cast<int32_t>(sc[0 + parity]);
-                const int32_t s1 = static_cast<int32_t>(sc[2 + parity]);
-                const int32_t s2 = static_cast<int32_t>(sc[4 + parity]);
-                const int32_t s3 = static_cast<int32_t>(sc[6 + parity]);
+                    weighted_unsigned_dot += s0 * q0 * static_cast<int32_t>(aq[l +  0]);
+                    weighted_unsigned_dot += s1 * q1 * static_cast<int32_t>(aq[l + 32]);
+                    weighted_unsigned_dot += s2 * q2 * static_cast<int32_t>(aq[l + 64]);
+                    weighted_unsigned_dot += s3 * q3 * static_cast<int32_t>(aq[l + 96]);
+                }
+            };
 
-                weighted_unsigned_dot += s0 * q0 * static_cast<int32_t>(aq[l +  0]);
-                weighted_unsigned_dot += s1 * q1 * static_cast<int32_t>(aq[l + 32]);
-                weighted_unsigned_dot += s2 * q2 * static_cast<int32_t>(aq[l + 64]);
-                weighted_unsigned_dot += s3 * q3 * static_cast<int32_t>(aq[l + 96]);
-            }
+            accumulate_l_range(0, 16, s0a, s1a, s2a, s3a);
+            accumulate_l_range(16, 32, s0b, s1b, s2b, s3b);
         }
 
         // Correct all q values from [0,63] to [-32,31] in one compact pass:
