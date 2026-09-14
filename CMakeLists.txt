@@ -70,11 +70,11 @@ else()
 endif()
 
 # Define the executable and its source files
-add_executable(minicpm_engine ${SOURCES})
+add_executable(minicpm5-cli ${SOURCES})
 
 # Compiler flags for optimization
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(minicpm_engine PRIVATE -O3 -march=native -ffast-math ${SIMD_FLAGS})
+    target_compile_options(minicpm5-cli PRIVATE -O3 -march=native -ffast-math ${SIMD_FLAGS})
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
     set(MINICPM_OMP_FLAG "")
     if(MINICPM_USE_OPENMP_LLVM)
@@ -86,7 +86,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
             message(STATUS "MSVC: /openmp:llvm not supported by compiler; using OpenMP target defaults.")
         endif()
     endif()
-    target_compile_options(minicpm_engine PRIVATE /O2 /fp:fast ${SIMD_FLAGS} ${MINICPM_OMP_FLAG})
+    target_compile_options(minicpm5-cli PRIVATE /O2 /fp:fast ${SIMD_FLAGS} ${MINICPM_OMP_FLAG})
 endif()
 
 # Link OpenMP if found
@@ -94,7 +94,7 @@ if(OpenMP_CXX_FOUND)
     if(MSVC AND MINICPM_OMP_FLAG STREQUAL "/openmp:llvm")
         message(STATUS "MSVC: relying on /openmp:llvm runtime (no OpenMP::OpenMP_CXX link target).")
     else()
-        target_link_libraries(minicpm_engine PUBLIC OpenMP::OpenMP_CXX)
+        target_link_libraries(minicpm5-cli PUBLIC OpenMP::OpenMP_CXX)
     endif()
 else()
     message(WARNING "OpenMP not found! The engine will run single-threaded and much slower.")

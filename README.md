@@ -88,7 +88,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
-The compiled binary `minicpm_engine` will be generated in the `build/` directory.
+The compiled binary `minicpm5-cli` will be generated in the `build/` directory.
 
 ### Windows (MSVC)
 
@@ -100,7 +100,7 @@ cmake -S . -B build -DMINICPM_ENABLE_AVX2=ON -DMINICPM_USE_OPENMP_LLVM=ON -DCMAK
 cmake --build build --config Release -- /m
 ```
 
-The binary will be at `build\Release\minicpm_engine.exe`.
+The binary will be at `build\Release\minicpm5-cli.exe`.
 
 ---
 
@@ -132,16 +132,16 @@ python3 tools/generate_header.py /path/to/MiniCPM5-2B-Q4_K_M.gguf
 
 ```bash
 # Show usage and available flags
-./minicpm_engine --help
+./minicpm5-cli --help
 
 # Run with default Portuguese test prompt
-./minicpm_engine
+./minicpm5-cli
 
 # Run a custom prompt with 4 threads, disable the </think> reasoning tag
-OMP_NUM_THREADS=4 ./minicpm_engine --text "Explain the theory of relativity simply." --no-think
+OMP_NUM_THREADS=4 ./minicpm5-cli --text "Explain the theory of relativity simply." --no-think
 
 # Specify custom model path
-./minicpm_engine -m /path/to/MiniCPM5-2B-Q4_K_M.gguf --text "Your prompt here"
+./minicpm5-cli -m /path/to/MiniCPM5-2B-Q4_K_M.gguf --text "Your prompt here"
 ```
 
 ### Command-Line Arguments
@@ -317,7 +317,7 @@ The result of 15 + 27 is 42.
 ## 🐛 Troubleshooting
 
 **Issue:** Slow performance even with multiple threads
-- **Solution:** Ensure OpenMP is properly linked. Check with `ldd minicpm_engine` (Linux) or verify OpenMP flags during compilation. Configure OpenMP environment variables as shown above.
+- **Solution:** Ensure OpenMP is properly linked. Check with `ldd minicpm5-cli` (Linux) or verify OpenMP flags during compilation. Configure OpenMP environment variables as shown above.
 
 **Issue:** Model file not found
 - **Solution:** Use absolute path with `-m` flag or place the GGUF file in the same directory as the executable.

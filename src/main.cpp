@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: ./minicpm_engine [options]\n"
+            std::cout << "Usage: ./minicpm5-cli [options]\n"
                       << "Options:\n"
                       << "  --text \"...\"      Input prompt text (default: \"O Brasil é um país\")\n"
                       << "  -m <path>         Path to GGUF model\n"
