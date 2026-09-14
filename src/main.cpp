@@ -3,7 +3,6 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool.h"
-#include "tool_examples/examples.h"
 
 // Para adicionar tools, inclua tool_function.h e registre no registry:
 //
@@ -234,7 +233,6 @@ int main(int argc, char** argv) {
     // O renderer injeta as definicoes (registry.definitions()) no system prompt.
     // Veja o bloco de comentario no topo deste arquivo para exemplos de como adicionar.
     ToolRegistry registry;
-    register_example_tools(registry);
     std::vector<std::string> tool_defs = registry.definitions();
     opts.tools_json = tool_defs;
     chat_template::Renderer renderer("<s>");
