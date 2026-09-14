@@ -127,7 +127,11 @@ int main(int argc, char** argv) {
     }
 
     ChatSession session(engine, tokenizer, registry, config);
-    session.set_system_prompt("You are a helpful assistant. Use the provided tools when they help answer the user.");
+    if (registry.definitions().empty()) {
+        session.set_system_prompt("You are a helpful assistant.");
+    } else {
+        session.set_system_prompt("You are a helpful assistant. Use the provided tools when they help answer the user.");
+    }
 
     // ========================================================================
     // DISPATCH: single-shot vs interactive REPL
