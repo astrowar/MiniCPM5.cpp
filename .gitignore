@@ -5,6 +5,7 @@
 /CMakeFiles/
 /Testing/
 /.cmake/
+/tests/chat_template/build/
 
 # CMake generated files
 /CMakeCache.txt
