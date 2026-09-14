@@ -14,6 +14,12 @@
 //     ToolRegistry registry;
 //     registry.add<MinhaTool>();
 //
+// Ou registre uma funcao comum diretamente (ver tool_function.h):
+//     registry.add_function("add", "Adds two integers", add, {
+//         TOOL_ARG(a, "First integer"),
+//         TOOL_ARG(b, "Second integer")
+//     });
+//
 // O main so precisa:
 //   - ParsedCall parse_tool_call(text)     -> detecta <function> na saida
 //   - registry.execute(name, args)         -> despacha para a tool certa
@@ -25,6 +31,15 @@ struct ParsedCall {
     std::string name;
     std::vector<std::pair<std::string, std::string>> args;
 };
+
+// Metadado de um parametro de tool (nome + descricao + opcional).
+struct ToolParam {
+    std::string name;
+    std::string description;
+    bool required = true;
+};
+
+#define TOOL_ARG(name, desc) ToolParam{#name, desc}
 
 // Classe base para tools. Todo tool concreto deriva dela e implementa as tres
 // funcoes puras. execute() e const: a execucao nao mutacao o estado do tool.
@@ -39,6 +54,9 @@ public:
     virtual std::string definition() const = 0;
 };
 
+// Forward declaration (definicao em tool_function.h).
+template<typename F> class FunctionTool;
+
 // Registro/dispensador de tools: mapeia name -> Tool.
 class ToolRegistry {
 public:
@@ -48,6 +66,14 @@ public:
     void add(Args&&... args) {
         static_assert(std::is_base_of<Tool, T>::value, "T deve derivar de Tool");
         tools_.push_back(std::make_shared<T>(std::forward<Args>(args)...));
+    }
+
+    // Registra uma funcao C++ como tool (requer include de tool_function.h).
+    template <typename F>
+    void add_function(const std::string& name, const std::string& description,
+                      F function, std::vector<ToolParam> params) {
+        tools_.push_back(std::make_shared<FunctionTool<std::decay_t<F>>>(
+            name, description, std::move(function), std::move(params)));
     }
 
     // Executa a tool pelo nome; se nao existir, devolve um JSON de erro.
