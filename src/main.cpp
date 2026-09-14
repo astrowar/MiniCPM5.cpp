@@ -3,6 +3,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool.h"
+#include "tool_examples/examples.h"
 
 // Para adicionar tools, inclua tool_function.h e registre no registry:
 //
@@ -114,6 +115,10 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+
+    // Garante que a saida nao seja guardada em buffer (ideal para streaming em tempo real)
+    std::setvbuf(stdout, NULL, _IONBF, 0);
+    std::cout.setf(std::ios::unitbuf);
 
     std::string text_prompt;
     bool interactive = false;
@@ -229,6 +234,7 @@ int main(int argc, char** argv) {
     // O renderer injeta as definicoes (registry.definitions()) no system prompt.
     // Veja o bloco de comentario no topo deste arquivo para exemplos de como adicionar.
     ToolRegistry registry;
+    register_example_tools(registry);
     std::vector<std::string> tool_defs = registry.definitions();
     opts.tools_json = tool_defs;
     chat_template::Renderer renderer("<s>");
@@ -284,25 +290,34 @@ int main(int argc, char** argv) {
     };
 
     // Buffers por turno: conteudo de raciocinio (think) e conteudo principal.
-    // A resposta nao e streamizada token a token; e bufferizada e impressa no
-    // fim do turno, porque a deteccao de tool call precisa do texto completo.
+    // Fazemos o streaming token a token em tempo real sempre.
     std::string think_buf, main_buf;
     bool in_thinking = false;
+    auto set_thinking = [&](bool thinking) {
+        if (thinking == in_thinking) return;
+        in_thinking = thinking;
+        std::cout << (in_thinking ? "<think>\n" : "\n</think>\n") << std::flush;
+    };
     auto buffer_token = [&](int token_id) {
         if (think_begin_token_ids.find(token_id) != think_begin_token_ids.end()) {
-            in_thinking = true;
+            set_thinking(true);
             return;
         }
         if (think_end_token_ids.find(token_id) != think_end_token_ids.end()) {
-            in_thinking = false;
+            set_thinking(false);
             return;
         }
         if (hidden_token_ids.find(token_id) != hidden_token_ids.end()) {
             return;
         }
         std::string d = tokenizer.decode(token_id);
-        if (in_thinking) think_buf += d;
-        else main_buf += d;
+        if (in_thinking) {
+            think_buf += d;
+            std::cout << d << std::flush;
+        } else {
+            main_buf += d;
+            std::cout << d << std::flush;
+        }
     };
 
     if (verbose) {
@@ -369,7 +384,7 @@ int main(int argc, char** argv) {
 
             // Primeiro token gerado
             if (!is_stop_token(next_token)) {
-                if (enable_think && !in_thinking) in_thinking = true;
+                if (enable_think) set_thinking(true);
                 buffer_token(next_token);
             }
 
@@ -394,7 +409,7 @@ int main(int argc, char** argv) {
             g_tokens += (double)turn_gen;
 
             if (verbose) {
-                std::cout << "[Turn " << turn << "] Generated " << turn_gen << " tokens." << std::endl;
+                std::cout << "\n[Turn " << turn << "] Generated " << turn_gen << " tokens." << std::endl;
                 if (!think_buf.empty()) std::cout << "[Turn " << turn << "] Reasoning: " << think_buf << std::endl;
                 std::cout << "[Turn " << turn << "] Raw output: " << main_buf << std::endl;
             }
@@ -403,8 +418,6 @@ int main(int argc, char** argv) {
             ParsedCall call = parse_tool_call(main_buf);
             if (call.name.empty()) {
                 // Resposta final
-                if (verbose && !think_buf.empty()) std::cout << "\n[Final] " << std::endl;
-                std::cout << main_buf << std::flush;
 
                 // Preserva na conversa (para contexto multi-turno no modo REPL)
                 chat_template::Message asst;
