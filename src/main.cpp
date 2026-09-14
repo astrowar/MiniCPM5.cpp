@@ -1,6 +1,7 @@
 #include "model.h"
 #include "omp_config.h"
 #include "tokenizer.h"
+#include "chat_template.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -189,9 +190,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<ChatMessage> chat;
-    chat.push_back({"user", text_prompt});
-    std::string full_prompt = apply_chat_template(chat, true, enable_think);
+    chat_template::Message user_msg;
+    user_msg.role = "user";
+    user_msg.content = text_prompt;
+    chat_template::Options opts;
+    opts.add_generation_prompt = true;
+    opts.enable_thinking = enable_think;
+    chat_template::Renderer renderer("<s>");
+    std::string full_prompt = renderer.render({user_msg}, opts);
 
     if (verbose) {
         std::cout << "\n[Format] Applying chat template (think=" << (enable_think ? "yes" : "no") << ")..." << std::endl;
