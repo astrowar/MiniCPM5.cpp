@@ -45,6 +45,9 @@ public:
     const std::vector<float>& forward(int token_id, int pos, int max_seq_len);
 
 private:
+    bool load_gguf_file(const std::string& gguf_path, bool verbose);
+    void map_tensors(bool verbose);
+
     std::unique_ptr<std::vector<char>> raw_gguf_buffer_;
     ModelWeights weights_;
     std::vector<KVCacheLayer> kv_caches_;

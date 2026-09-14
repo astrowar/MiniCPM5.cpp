@@ -7,6 +7,12 @@
 #include <vector>
 
 // ============================================================================
+// SEMANTIC TYPE ALIASES (Enhances code readability)
+// ============================================================================
+using ParsedArgs = std::vector<std::pair<std::string, std::string>>;
+using ToolDefinitionList = std::vector<std::string>;
+
+// ============================================================================
 // TOOL CALLING: infraestrutura generica de tools para o motor
 //
 // Registre uma funcao/lambda como tool (ver tool_function.h):
@@ -24,7 +30,7 @@
 // Um tool call emitido pelo modelo: name + argumentos chave/valor.
 struct ParsedCall {
     std::string name;
-    std::vector<std::pair<std::string, std::string>> args;
+    ParsedArgs args;
 };
 
 // Metadado de um parametro de tool (nome + descricao + opcional).
@@ -44,7 +50,7 @@ public:
     // Nome que o modelo usa em <function name="...">.
     virtual std::string name() const = 0;
     // Executa a tool com os argumentos; devolve o resultado (string, ex.: JSON).
-    virtual std::string execute(const std::vector<std::pair<std::string, std::string>>& args) const = 0;
+    virtual std::string execute(const ParsedArgs& args) const = 0;
     // Definicao JSON da tool (injetada no system prompt via Options.tools_json).
     virtual std::string definition() const = 0;
 };
@@ -71,11 +77,10 @@ public:
     }
 
     // Executa a tool pelo nome; se nao existir, devolve um JSON de erro.
-    std::string execute(const std::string& name,
-                        const std::vector<std::pair<std::string, std::string>>& args) const;
+    std::string execute(const std::string& name, const ParsedArgs& args) const;
 
     // Definicoes JSON de todas as tools (para Options.tools_json).
-    std::vector<std::string> definitions() const;
+    ToolDefinitionList definitions() const;
 
 private:
     std::vector<std::shared_ptr<Tool>> tools_;

@@ -12,6 +12,34 @@
 #define RESTRICT
 #endif
 
+// ============================================================================
+// AVX2 SIMD ACCELERATED VECTOR OPERATIONS (THEORY & HARDWARE)
+//
+// AVX2 (Advanced Vector Extensions 2) is an instruction set extension for x86 CPUs.
+// It expands vector registers from 128 bits (SSE) to 256 bits, enabling the CPU
+// to load, store, and process 256 bits of data in a single instruction clock cycle.
+//
+// For Deep Learning operations:
+//   - A 256-bit AVX2 register can hold 8 single-precision float (32-bit) values
+//     or 8 signed 32-bit integer values.
+//   - By executing SIMD (Single Instruction, Multiple Data) operations (such as FMA:
+//     Fused Multiply-Add, executing a * b + c), we can achieve up to an 8x theoretical
+//     performance speedup compared to scalar calculations.
+//
+// This file implements vectorized kernels for row-wise quantization, matrix-vector
+// multiplications, and dot products using Intel/AMD AVX2 intrinsics.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Horizontal Reduction Helpers
+//
+// Since SIMD vector registers are arranged "vertically" (applying operations
+// to indices parallelly across columns), summing or finding the maximum element
+// across a single 256-bit register ("horizontally") requires shuffling and blending
+// values across 128-bit lanes.
+// ----------------------------------------------------------------------------
+
+// Horizontal sum of 8 float32 values in a 256-bit __m256 register
 static inline float hsum_f32_8(__m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     s = _mm_add_ps(s, _mm_movehl_ps(s, s));
@@ -19,6 +47,7 @@ static inline float hsum_f32_8(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
+// Fast horizontal sum of 8 int32 values in a 256-bit __m256i register
 static inline int hsum_i32_8_fast(__m256i v) {
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     __m128i hi64 = _mm_unpackhi_epi64(s, s);
@@ -27,6 +56,7 @@ static inline int hsum_i32_8_fast(__m256i v) {
     return _mm_cvtsi128_si32(_mm_add_epi32(s, hi32));
 }
 
+// Horizontal maximum of 8 float32 values in a 256-bit __m256 register
 static inline float hmax_f32_8(__m256 v) {
     __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     m = _mm_max_ps(m, _mm_movehl_ps(m, m));
@@ -47,6 +77,11 @@ static inline float fp16_to_fp32_hot(ggml_fp16_t h) {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+// FP32 to Q8_K Row-Wise Quantization (AVX2-optimized)
+//
+// Scales and quantizes a row of 32-bit floats into signed 8-bit integers.
+// ----------------------------------------------------------------------------
 void quantize_row_q8_K_avx2(const float* RESTRICT x, block_q8_K* RESTRICT y, int n) {
     assert(n % QK_K == 0);
     const __m256 sign_bit = _mm256_set1_ps(-0.0f);
@@ -59,6 +94,8 @@ void quantize_row_q8_K_avx2(const float* RESTRICT x, block_q8_K* RESTRICT y, int
         block_q8_K& dst = y[ib];
         __m256 vmax0 = _mm256_setzero_ps();
         __m256 vmax1 = _mm256_setzero_ps();
+        
+        // 1. Find the absolute maximum value (amax) of the 256 floats in the block in parallel
         for (int i = 0; i < QK_K; i += 16) {
             __m256 v0 = _mm256_loadu_ps(x + i + 0);
             __m256 v1 = _mm256_loadu_ps(x + i + 8);
@@ -76,6 +113,7 @@ void quantize_row_q8_K_avx2(const float* RESTRICT x, block_q8_K* RESTRICT y, int
         dst.d = amax / 127.0f;
         const __m256 mul = _mm256_set1_ps(127.0f / amax);
 
+        // 2. Multiply, round, clamp to [-127, 127] and pack 32-bit ints into 8-bit bytes
         for (int i = 0; i < QK_K; i += 32) {
             auto cvt8 = [&](const float* p) {
                 __m256 v = _mm256_mul_ps(_mm256_loadu_ps(p), mul);
@@ -95,6 +133,7 @@ void quantize_row_q8_K_avx2(const float* RESTRICT x, block_q8_K* RESTRICT y, int
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst.qs + i), q8);
         }
 
+        // 3. Compute the block sums (bsums) of the quantized weights
         // bsums are needed by Q4_K minima and Q6_K's -32 offset correction.
         for (int g = 0; g < QK_K / 16; ++g) {
             const __m128i q8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst.qs + 16*g));
@@ -104,9 +143,13 @@ void quantize_row_q8_K_avx2(const float* RESTRICT x, block_q8_K* RESTRICT y, int
     }
 }
 
-// Q4_K row dot: keep eight partial sums live in FP32 SIMD across ALL 256-element
-// blocks and reduce once at the end of the row. This removes one horizontal
-// reduction from every superblock.
+// ----------------------------------------------------------------------------
+// Q4_K x Q8_K dot-product row kernel (AVX2-optimized)
+//
+// Keeps eight partial sums live in FP32 SIMD registers across all 256-element blocks,
+// and performs horizontal reduction once at the end. This avoids costly horizontal
+// reduction steps in the middle of superblock iterations.
+// ----------------------------------------------------------------------------
 static inline float dot_row_q4_K_q8_K_avx2(
         const block_q4_K* RESTRICT w,
         const block_q8_K* RESTRICT a,
@@ -120,6 +163,8 @@ static inline float dot_row_q4_K_q8_K_avx2(
         decode_q4k_scales_mins(w[b].scales, scales, mins);
 
         __m256i isum = _mm256_setzero_si256();
+        
+        // Unpack 4-bit nibbles, multiply by input values and scales, and accumulate
         for (int j = 0; j < 4; ++j) {
             const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[b].qs + 32*j));
             const __m256i qlo = _mm256_and_si256(packed, mask4);
@@ -127,6 +172,7 @@ static inline float dot_row_q4_K_q8_K_avx2(
             const __m256i xlo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a[b].qs + 64*j));
             const __m256i xhi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a[b].qs + 64*j + 32));
 
+            // maddubs computes: out[i] = q[2*i] * x[2*i] + q[2*i+1] * x[2*i+1] (8-bit to 16-bit)
             __m256i p0 = _mm256_maddubs_epi16(qlo, xlo);
             __m256i p1 = _mm256_maddubs_epi16(qhi, xhi);
             p0 = _mm256_madd_epi16(p0, _mm256_set1_epi16(static_cast<int16_t>(scales[2*j + 0])));
@@ -137,6 +183,7 @@ static inline float dot_row_q4_K_q8_K_avx2(
         const float ds = a[b].d * fp16_to_fp32_hot(w[b].d);
         acc = _mm256_fmadd_ps(_mm256_set1_ps(ds), _mm256_cvtepi32_ps(isum), acc);
 
+        // Apply scale/bias offset for minima using block sums
         int32_t minsum = 0;
         for (int g = 0; g < 8; ++g) {
             const int32_t sx = static_cast<int32_t>(a[b].bsums[2*g]) + static_cast<int32_t>(a[b].bsums[2*g + 1]);
@@ -250,6 +297,25 @@ void gemv_q6_K_q8_K_avx2(const char* RESTRICT matrix_weights, const block_q8_K* 
     }
 }
 
+// ----------------------------------------------------------------------------
+// Fused QKV (Query, Key, Value) AVX2 Kernels
+//
+// In Transformer blocks, the input vector must be multiplied by three separate
+// weight matrices (W_q, W_k, W_v) to generate Query, Key, and Value embeddings.
+//
+// Naive implementation spawns three separate `#pragma omp parallel for` loops.
+// This introduces significant thread synchronization overhead (fork/join) and
+// evicts the input activation vector (xq) from the CPU L1/L2 cache three times.
+//
+// **Kernel Fusion**:
+// We collapse the three distinct loops into a single "flattened" parallel region.
+// The total number of rows is `q_rows + kv_rows + kv_rows`. Each OpenMP thread
+// calculates its absolute row index `r`, dynamically routing it to the correct
+// sub-projection (Q, K, or V) matrix pointer.
+// This preserves CPU cache locality for `xq` and completely eliminates redundant
+// thread synchronization stalls.
+// ----------------------------------------------------------------------------
+
 // Fused QKV (all Q4_K): single flattened parallel for over total rows.
 void gemv_qkv_q4_K_q8_K_avx2(const char* wq, const char* wk, const char* wv,
                               const block_q8_K* RESTRICT xq,
@@ -265,18 +331,23 @@ void gemv_qkv_q4_K_q8_K_avx2(const char* wq, const char* wk, const char* wv,
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < total; ++r) {
         if (r < q_rows) {
+            // Process Query matrix row
             q[r] = dot_row_q4_K_q8_K_avx2(bq + static_cast<size_t>(r)*nb, xq, nb);
         } else if (r < q_rows + kv_rows) {
+            // Process Key matrix row
             int kr = r - q_rows;
             k[kr] = dot_row_q4_K_q8_K_avx2(bk + static_cast<size_t>(kr)*nb, xq, nb);
         } else {
+            // Process Value matrix row
             int vr = r - q_rows - kv_rows;
             v[vr] = dot_row_q4_K_q8_K_avx2(bv + static_cast<size_t>(vr)*nb, xq, nb);
         }
     }
 }
 
-// Fused QKV (q/k Q4_K, v Q6_K): single flattened parallel for.
+// Fused QKV (Q and K in Q4_K format, V in Q6_K format)
+// Value (V) projections sometimes require higher precision (6-bit) to preserve 
+// generation quality, while Q and K matrices route mostly semantic layout features.
 void gemv_qkv_q4_q4_q6_q8_K_avx2(const char* wq, const char* wk, const char* wv,
                                   const block_q8_K* RESTRICT xq,
                                   float* RESTRICT q, float* RESTRICT k, float* RESTRICT v,

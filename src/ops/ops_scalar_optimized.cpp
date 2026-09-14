@@ -15,10 +15,26 @@
 // PORTABLE SCALAR REFERENCE FOR Q4_K/Q6_K x Q8_K
 // =============================================================================
 //
+// This file serves as the portable scalar C++ implementation of the core GEMV
+// operations for quantized large language models. It acts as both a fallback
+// for non-SIMD architectures and the primary mathematical reference to ensure
+// exact equivalence across vector backends (AVX2, NEON, etc.).
+//
+// **THEORETICAL FOUNDATION: LLM.int8() & Block-wise Quantization**
+// According to classic quantization literature (e.g., "LLM.int8(): 8-bit Matrix 
+// Multiplication for Transformers at Scale" by Dettmers et al., 2022), naive 
+// global quantization degrades model perplexity due to outlier features in activations.
+//
+// The GGML format mitigates this via extreme block-wise quantization:
+// dividing weight tensors into tiny independent groups (blocks of 32 or 256).
+// Each block maintains its own independent scaling factor (d) in float16.
+// This preserves the high dynamic range required by outlier features while 
+// allowing integer arithmetic across 99% of the multiplication loop.
+//
 // Design goals:
 //   1. Never dequantize every weight to FP32 in the inner loop.
-//   2. Quantize the activation x to Q8_K once.
-//   3. Accumulate weight * activation products in integer arithmetic.
+//   2. Quantize the activation vector x to Q8_K once.
+//   3. Accumulate weight * activation products entirely in 32-bit integer arithmetic.
 //   4. Apply floating-point block scales only once per 256-value super-block.
 //   5. Use Q8_K.bsums for Q4_K minima and Q6_K's -32 zero-point correction.
 //   6. Expose row kernels with no allocation/threading so another ISA backend
@@ -27,7 +43,7 @@
 //
 // IMPORTANT:
 //   This is a reference implementation, not an attempt to beat SIMD with scalar
-//   C++.  Keep the math equivalent when writing NEON/SVE/RVV/etc. kernels.
+//   C++. Keep the math equivalent when writing NEON/SVE/RVV/etc. kernels.
 // =============================================================================
 
 namespace {
@@ -143,12 +159,15 @@ float dot_row_q4_K_q8_K_scalar(
         // Integer part of:
         //   sum_g scale[g] * sum_i(q4[i] * q8[i])
         //
-        // q4 is kept as unsigned [0,15].  We do NOT construct FP32 weights.
+        // q4 is kept as unsigned [0,15]. We do NOT construct FP32 weights inside the loop.
         int32_t weighted_dot = 0;
 
-        // Physical Q4_K layout: each 32-byte chunk contains 64 weights:
-        //   low nibble  -> first  32-value group
-        //   high nibble -> second 32-value group
+        // **Physical Q4_K Layout Optimization**:
+        // A standard 8-bit byte holds two 4-bit weights (nibbles). Instead of interleaving
+        // them continuously (w0, w1, w2...), GGML stores all the lower nibbles for the first
+        // 32-value group, and the upper nibbles represent the next 32-value group.
+        // This structural optimization allows the SIMD code (and this scalar code) to cleanly
+        // mask (0x0F) or shift (>> 4) an entire array chunk at once without branching.
         for (int chunk = 0; chunk < 4; ++chunk) {
             const uint8_t* packed = wb.qs + chunk * 32;
             const int xbase = chunk * 64;
@@ -158,7 +177,9 @@ float dot_row_q4_K_q8_K_scalar(
 
             for (int i = 0; i < 32; ++i) {
                 const uint8_t byte = packed[i];
+                // Lower 4 bits (nibble) -> corresponds to the first block of 32 activations
                 const int32_t qlo = static_cast<int32_t>(byte & 0x0F);
+                // Upper 4 bits (nibble) -> corresponds to the second block of 32 activations
                 const int32_t qhi = static_cast<int32_t>(byte >> 4);
 
                 dot_lo += qlo * static_cast<int32_t>(ab.qs[xbase + i]);
@@ -169,12 +190,18 @@ float dot_row_q4_K_q8_K_scalar(
             weighted_dot += static_cast<int32_t>(scales[2 * chunk + 1]) * dot_hi;
         }
 
-        // Q4_K real weight is approximately:
-        //   weight = d * scale[g] * q4 - dmin * min[g]
+        // **Q4_K Dequantization Math**:
+        // The real reconstructed weight value is defined mathematically as:
+        //   weight = (global_scale * local_scale[g] * q4_value) - (global_min * local_min[g])
         //
-        // Therefore the min contribution needs only sum(q8) for each group.
-        // Q8_K already stores sums of 16 values, so two bsums = one Q4_K
-        // 32-value group. No per-weight subtraction is required.
+        // Expanding the dot product: sum(weight * activation)
+        //   = sum[ (d*s*q - dmin*m) * (x_d*x_q) ]
+        //   = (x_d*d) * sum(s*q*x_q) - (x_d*dmin) * sum(m*x_q)
+        //
+        // The second term requires sum(x_q) per 32-value group. The Q8_K format
+        // brilliantly precalculates 'bsums' (sum of 16 activations), so two 'bsums'
+        // perfectly equal the sum needed for one Q4_K minimum offset. 
+        // This algorithmic trick completely avoids per-weight subtraction!
         int32_t min_dot = 0;
         for (int g = 0; g < 8; ++g) {
             const int32_t sum_x =

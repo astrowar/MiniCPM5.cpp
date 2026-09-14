@@ -48,19 +48,18 @@ ParsedCall parse_tool_call(const std::string& text) {
     }
     return r;
 }
-
-std::string ToolRegistry::execute(const std::string& name,
-                                  const std::vector<std::pair<std::string, std::string>>& args) const {
+std::string ToolRegistry::execute(const std::string& name, const ParsedArgs& args) const {
     for (const auto& t : tools_) {
-        if (t->name() == name) return t->execute(args);
+        if (t->name() == name) {
+            return t->execute(args);
+        }
     }
-    return "{\"error\": \"unknown tool: " + name + "\"}";
+    return "{\"error\": \"Tool not found: \\\"" + name + "\\\"\"}";
 }
 
-std::vector<std::string> ToolRegistry::definitions() const {
-    std::vector<std::string> out;
+ToolDefinitionList ToolRegistry::definitions() const {
+    ToolDefinitionList out;
     out.reserve(tools_.size());
     for (const auto& t : tools_) out.push_back(t->definition());
     return out;
 }
-

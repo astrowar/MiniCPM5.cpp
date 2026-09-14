@@ -7,10 +7,29 @@
 #include <cstring>
 
 // ============================================================================
-// 2. KERNELS DE PRODUTO ESCALAR "ON-THE-FLY" (GEMV) MULTI-THREAD (OPENMP)
+// 2. "ON-THE-FLY" GENERAL MATRIX-VECTOR MULTIPLICATION (GEMV) KERNELS
+//
+// In large language models, matrix multiplications (GEMV / GEMM) are the primary
+// computational bottleneck. To execute a single forward pass, the model must read
+// billions of weight parameters from memory. Since CPUs are bounded by memory
+// bandwidth rather than raw ALU compute, loading standard 32-bit floats (FP32)
+// would result in extremely slow execution speeds.
+//
+// To resolve this, weights are stored in quantized (compressed) block formats
+// (e.g., 4-bit Q4_K, 6-bit Q6_K, or 8-bit Q8_0). During inference, these low-bit
+// weights are decompressed "on-the-fly" directly inside the CPU's registers or
+// caches, where they are multiplied with the input vector. This drastically
+// reduces memory traffic (up to 8x) and enables fast local inference on standard CPUs.
 // ============================================================================
 
-// GEMV para Tensores Float32
+// ----------------------------------------------------------------------------
+// GEMV for Float32 Tensors (Standard Precision)
+//
+// Computes a standard matrix-vector multiplication without quantization:
+//   out = Matrix(W) * Vector(X)
+// This is typically used for small, non-quantized layers (like final classification
+// heads or small scaling parameters) that demand maximum numerical fidelity.
+// ----------------------------------------------------------------------------
 void gemv_f32(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const float* w = reinterpret_cast<const float*>(matrix_weights);
     #pragma omp parallel for schedule(static)
@@ -24,7 +43,19 @@ void gemv_f32(const char* matrix_weights, const float* x, float* out, int num_ro
     }
 }
 
-// GEMV para Tensores Q8_0 (Int8)
+// ----------------------------------------------------------------------------
+// GEMV for Q8_0 Tensors (Block-Wise 8-Bit Quantization)
+//
+// In the GGML Q8_0 quantization format:
+//   - Weights are organized into blocks of 32 (QK8_0 = 32).
+//   - Each block stores a shared scaling factor (d) in half-precision Float16 (2 bytes)
+//     and 32 signed 8-bit integers (32 bytes).
+//   - Total footprint per block: 34 bytes for 32 weights (~8.5 bits per weight).
+//   - Decompression formula: weight = scale * quant_value = fp16_to_fp32(d) * qs[i].
+//
+// This format serves as an excellent balance between decompression speed and
+// near-perfect model accuracy.
+// ----------------------------------------------------------------------------
 void gemv_q8_0(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(matrix_weights);
     int blocks_per_row = num_cols / QK8_0;
@@ -48,40 +79,67 @@ void gemv_q8_0(const char* matrix_weights, const float* x, float* out, int num_r
     }
 }
 
-// GEMV para Tensores Q4_K (Int4) - Escalar Puro
+// ----------------------------------------------------------------------------
+// GEMV for Q4_K Tensors (Block-Wise 4-Bit "K-Quantization" - Scalar Implementation)
+//
+// In the GGML Q4_K format:
+//   - Weights are grouped into large superblocks of 256 parameters (QK_K = 256).
+//   - Each superblock contains a global scale (d) in FP16 and a global offset (dmin) in FP16.
+//   - The superblock is divided into 8 subblocks of 32 weights. Each subblock features
+//     its own local 6-bit scale and 6-bit minimum offset (mins) to preserve high dynamic range.
+//   - Each 4-bit quantized weight (qs) is reconstructed using the formula:
+//       weight = d * scale * qs[i] - dmin * min
+//
+// This is the default format for consumer-grade CPU setups, achieving massive 
+// compression (~4.5 bits per parameter) with minimal degradation in model perplexity.
+// ----------------------------------------------------------------------------
 void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
 
+    // Distribute calculation of output rows across multiple CPU cores using OpenMP
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < num_rows; ++r) {
+        // Use two accumulation registers to reduce pipeline stalling due to data hazards
         float sum1 = 0.0f;
         float sum2 = 0.0f;
         int row_block_offset = r * super_blocks_per_row;
 
         for (int sb = 0; sb < super_blocks_per_row; ++sb) {
             const block_q4_K& bloco = blocks[row_block_offset + sb];
+            
+            // Convert the superblock's global scale and minimum offset from FP16 to FP32
             float d = fp16_to_fp32(bloco.d);
             float dmin = fp16_to_fp32(bloco.dmin);
             int x_offset = sb * QK_K;
+            
+            // Extract local 6-bit subblock scales and min offsets (contained within 12 bytes total)
             uint8_t scales[8], mins[8];
             decode_q4k_scales_mins(bloco.scales, scales, mins);
             const uint8_t* q = bloco.qs;
 
-            // Processa em chunks de 64
+            // Process the 256-weight superblock in 4 chunks of 64 weights each
             for (int chunk = 0; chunk < 4; ++chunk) {
                 const int j = chunk * 64;
+                
+                // Precompute the scales and minimum offsets for the two subblocks (32 weights each) within this chunk
                 float d1 = d * static_cast<float>(scales[2 * chunk + 0]);
                 float m1 = dmin * static_cast<float>(mins[2 * chunk + 0]);
                 float d2 = d * static_cast<float>(scales[2 * chunk + 1]);
                 float m2 = dmin * static_cast<float>(mins[2 * chunk + 1]);
 
+                // Unpack and multiply 32 pairs of 4-bit weights
                 for (int l = 0; l < 32; ++l) {
+                    // Extract lower 4 bits (nibble) for the first weight, scaling it and subtracting bias
                     float w1 = d1 * (q[l] & 0xF) - m1;
+                    // Extract upper 4 bits (nibble) for the second weight (offset by 32 elements)
                     float w2 = d2 * (q[l] >> 4) - m2;
+                    
+                    // Multiply with corresponding input vector elements and accumulate
                     sum1 += w1 * x[x_offset + j + l];
                     sum2 += w2 * x[x_offset + j + l + 32];
                 }
+                // Move weight pointer to the next subblock pair chunk (each holds 64 weights in 32 bytes)
                 q += 32;
             }
         }
@@ -89,7 +147,7 @@ void gemv_q4_K_scalar(const char* matrix_weights, const float* x, float* out, in
     }
 }
 
-// Dispatcher para GEMV Q4_K
+// Dispatcher for GEMV Q4_K (Automatically select AVX2 vectorization if compiled with AVX2 support)
 void gemv_q4_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
 #if defined(__AVX2__)
     gemv_q4_K_avx2(matrix_weights, x, out, num_rows, num_cols);
@@ -98,7 +156,19 @@ void gemv_q4_K(const char* matrix_weights, const float* x, float* out, int num_r
 #endif
 }
 
-// GEMV para Tensores Q6_K (Int6) - Escalar Puro
+// ----------------------------------------------------------------------------
+// GEMV for Q6_K Tensors (Block-Wise 6-Bit "K-Quantization" - Scalar Implementation)
+//
+// In the GGML Q6_K format:
+//   - Weights are organized in superblocks of 256 parameters (QK_K = 256).
+//   - Each 6-bit quantized weight is split across two arrays: 4 lower bits (ql)
+//     and 2 higher bits (qh) packed closely together to optimize byte alignment.
+//   - Each superblock includes 16 scales of 8 bits and a global FP16 scale (d).
+//   - Reconstructed as: weight = d * scale * (qs[i] - 32).
+//
+// Ideal for critical model layers (such as the embedding matrix or certain attention
+// projection weights) where maximum semantic reasoning and vocabulary precision are required.
+// ----------------------------------------------------------------------------
 void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
     const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
     int super_blocks_per_row = num_cols / QK_K;
@@ -121,14 +191,14 @@ void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, in
             const int8_t* sc = bloco.scales;
 
             for (int n = 0; n < QK_K; n += 128) {
-                // Primeira metade do loop (l = 0..15, is = 0)
+                // First half of the loop (l = 0..15, is = 0)
                 float s0 = d * sc[0];
                 float s2 = d * sc[2];
                 float s4 = d * sc[4];
                 float s6 = d * sc[6];
 
                 for (int l = 0; l < 16; ++l) {
-                    // Reconstroi os 6-bits signed inteiros (offset -32)
+                    // Reconstruct 6-bit signed integers (offset -32)
                     int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
                     int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
                     int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
@@ -168,7 +238,7 @@ void gemv_q6_K_scalar(const char* matrix_weights, const float* x, float* out, in
     }
 }
 
-// Dispatcher para GEMV Q6_K
+// Dispatcher para GEMV Q6_K (Seleciona automaticamente AVX2 se disponível)
 void gemv_q6_K(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
 #if defined(__AVX2__)
     gemv_q6_K_avx2(matrix_weights, x, out, num_rows, num_cols);
@@ -178,14 +248,25 @@ void gemv_q6_K(const char* matrix_weights, const float* x, float* out, int num_r
 }
 
 // ============================================================================
-// 3. DISPATCHER E OPERAÇÕES DA REDE NEURAL
+// 3. NEURAL NETWORK OPERATORS & DISPATCHERS
+//
+// This section contains high-level dispatcher functions for general matrix
+// multiplications (matmul) and highly optimized specialized kernels.
+// To reduce computational overhead, inputs are quantized to Q8_K before launching
+// core weight-matrix operations.
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// MATMUL (Universal GEMV Dispatcher)
+//
+// Automatically routes execution to the corresponding low-level optimized kernel
+// based on the Tensor's quantization type (F32, Q8_0, Q4_K, or Q6_K).
+// ----------------------------------------------------------------------------
 void matmul(std::vector<float>& output, const std::vector<float>& input, const Tensor& tensor) {
     uint64_t num_cols = tensor.dims[0];
     uint64_t num_rows = tensor.dims.size() > 1 ? tensor.dims[1] : 1;
     
-    // Ajusta o tamanho da saída se necessário
+    // Adjust output size if necessary
     if (output.size() != num_rows) {
         output.resize(num_rows);
     }
@@ -199,16 +280,24 @@ void matmul(std::vector<float>& output, const std::vector<float>& input, const T
     } else if (tensor.type_str == "Q6_K") {
         gemv_q6_K(tensor.data_ptr, input.data(), output.data(), num_rows, num_cols);
     } else {
-        // Fallback para tipos não implementados
+        // Fallback for unimplemented tensor types
         static bool warned = false;
         if (!warned) {
-            std::cout << "[AVISO] Kernel para o tipo " << tensor.type_str << " ainda nao foi implementado. Usando zeros." << std::endl;
+            std::cout << "[WARNING] matmul kernel for " << tensor.type_str << " not implemented yet. Using fallback values." << std::endl;
             warned = true;
         }
         std::fill(output.begin(), output.end(), 0.001f);
     }
 }
 
+// ----------------------------------------------------------------------------
+// QUANTIZE_ROW_Q8_K (FP32 to Q8_K Row-Wise Quantization)
+//
+// Quantizes a row of 32-bit floats (FP32) into a signed 8-bit block-wise format (Q8_K)
+// on-the-fly. This is typically applied to the input vector of a layer before
+// multiplying it with low-bit weight matrices.
+// Quantizing the input reduces memory traffic during dot-product accumulation.
+// ----------------------------------------------------------------------------
 void quantize_row_q8_K(const float* x, int n, block_q8_K* y) {
 #if defined(__AVX2__)
     quantize_row_q8_K_avx2(x, y, n);
@@ -219,6 +308,13 @@ void quantize_row_q8_K(const float* x, int n, block_q8_K* y) {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+// MATMUL_Q8K (Quantized Input GEMV)
+//
+// Performs matrix-vector multiplication directly using a pre-quantized Q8_K input vector.
+// This allows the engine to reuse the same quantized input across multiple weight projections,
+// eliminating redundant quantization steps and boosting overall performance.
+// ----------------------------------------------------------------------------
 void matmul_q8k(std::vector<float>& output, const block_q8_K* input_q8k, int num_cols, const Tensor& tensor) {
     uint64_t num_rows = tensor.dims.size() > 1 ? tensor.dims[1] : 1;
     if (output.size() != num_rows) {
@@ -258,13 +354,22 @@ void matmul_q8k(std::vector<float>& output, const block_q8_K* input_q8k, int num
     {
         static bool warned = false;
         if (!warned) {
-            std::cout << "[AVISO] matmul_q8k: tipo " << tensor.type_str << " nao suportado." << std::endl;
+            std::cout << "[WARNING] matmul_q8k: tensor type " << tensor.type_str << " not supported." << std::endl;
             warned = true;
         }
         std::fill(output.begin(), output.end(), 0.0f);
     }
 }
 
+// ----------------------------------------------------------------------------
+// MATMUL_QKV_Q8K (Fused QKV GEMV Projection)
+//
+// In Transformer self-attention, the input vector must be projected into Query (Q),
+// Key (K), and Value (V) spaces. Instead of spawning separate OpenMP regions for 
+// each projection—which incurs substantial thread fork/join overhead—this fused kernel
+// combines Q, K, and V projections into a single, unified parallel execution space.
+// This greatly increases cache locality and thread efficiency on multi-core CPUs.
+// ----------------------------------------------------------------------------
 void matmul_qkv_q8k(std::vector<float>& q, std::vector<float>& k, std::vector<float>& v,
                     const block_q8_K* input_q8k, int num_cols,
                     const Tensor& tensor_q, const Tensor& tensor_k, const Tensor& tensor_v) {
@@ -396,10 +501,42 @@ void matmul_gate_up_q8k(std::vector<float>& gate, std::vector<float>& up,
     }
 }
 
+// ============================================================================
+// ACTIVATION AND NORMALIZATION FUNCTIONS (THEORY & IMPLEMENTAION)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// SILU (Sigmoid Linear Unit / Swish)
+//
+// The SiLU activation function is mathematically defined as:
+//   SiLU(x) = x * sigmoid(x) = x / (1 + e^-x)
+//
+// Unlike the conventional ReLU (which zeros out negative values), SiLU is a
+// smooth curve that allows a small gradient flow for negative values (non-monotonicity).
+// This smoothness aids gradient flow during the training of deep networks,
+// and forms the basis of the SwiGLU activation used in modern LLMs like LLaMA and MiniCPM.
+// ----------------------------------------------------------------------------
 float silu(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
+// ----------------------------------------------------------------------------
+// RMSNORM (Root Mean Square Layer Normalization)
+//
+// RMSNorm is a computationally simplified alternative to traditional LayerNorm.
+// While LayerNorm centers and scales activations using both mean and variance
+// (requiring two passes over the data):
+//   LN(x) = (x - mean) / sqrt(variance + eps) * weight
+//
+// RMSNorm assumes that centering by the mean is unnecessary for training stability
+// and focuses solely on regulating the scale through the "Root Mean Square"
+// (the square root of the mean of squares), which requires only a single pass over memory:
+//   RMS(x) = sqrt( (1 / N) * sum(x_i^2) + eps )
+//   RMSNorm(x)_i = (x_i / RMS(x)) * weight_i
+//
+// This reduces memory bandwidth consumption and CPU clock cycles while preserving
+// the same or better convergence stability in large-scale models.
+// ----------------------------------------------------------------------------
 void rmsnorm(std::vector<float>& out, const std::vector<float>& x, const Tensor& weight_tensor, float eps) {
     const float* w = reinterpret_cast<const float*>(weight_tensor.data_ptr);
     int dim = x.size();
@@ -415,6 +552,25 @@ void rmsnorm(std::vector<float>& out, const std::vector<float>& x, const Tensor&
     }
 }
 
+// ----------------------------------------------------------------------------
+// ROPE (Rotary Position Embeddings)
+//
+// RoPE is an innovative relative position encoding technique applied directly
+// to the Query (Q) and Key (K) vectors of the attention mechanism.
+//
+// Instead of adding absolute positional embeddings to the input embeddings,
+// RoPE splits the dimension of each head (head_dim) into 2D pairs and rotates
+// each pair in the complex plane by an angle proportional to the token's position (pos)
+// and the dimension frequency:
+//   [v_0, v_1] rotated by m * theta:
+//   v_0' = v_0 * cos(m*theta) - v_1 * sin(m*theta)
+//   v_1' = v_0 * sin(m*theta) + v_1 * cos(m*theta)
+//
+// Where m = pos, and theta = base^(-2i / head_dim).
+// This rotation mathematically ensures that the dot product between Query and Key
+// (Q * K_T) depends purely on the relative distance between the two tokens:
+//   score(q_m, k_n) = f(q, m)^T * f(k, n) = g(q, k, m - n)
+// ----------------------------------------------------------------------------
 void apply_rope(std::vector<float>& vec, int pos, int head_idx, int head_dim, float rope_base) {
     for (int i = 0; i < head_dim; i += 2) {
         int idx = head_idx * head_dim + i;
@@ -431,7 +587,25 @@ void apply_rope(std::vector<float>& vec, int pos, int head_idx, int head_dim, fl
     }
 }
 
-// Atenção GQA (Grouped-Query Attention) com suporte a KV Cache
+// ----------------------------------------------------------------------------
+// GQA (Grouped-Query Attention) WITH KV CACHE
+//
+// The traditional Multi-Head Attention (MHA) mechanism pairs a Key (K) and
+// Value (V) head for every Query (Q) head. This creates a massive KV Cache
+// that consumes significant RAM and limits the maximum context size.
+//
+// Grouped-Query Attention (GQA) groups multiple Query heads to share a single
+// Key/Value head. For example, in an 8:1 ratio (as in MiniCPM), each K and V
+// head is shared by 8 Q heads.
+// GQA offers almost the same accuracy as traditional MHA, but with a tiny
+// fraction of the memory footprint and drastically superior decoding speeds.
+//
+// This function performs:
+//   1. Incremental caching of K and V into the layer's dynamic KV Cache buffer.
+//   2. Computation of scaled Attention Scores: (Q * K^T) / sqrt(head_dim).
+//   3. Numerically stable Softmax using maximum value subtraction.
+//   4. Weighted projection (Scores * V) to produce final attention activations.
+// ----------------------------------------------------------------------------
 void execute_attention(std::vector<float>& attn_out, 
                        const std::vector<float>& q, 
                        const std::vector<float>& k_curr, 
@@ -446,11 +620,12 @@ void execute_attention(std::vector<float>& attn_out,
     }
 
     if (pos >= max_seq_len) {
-        std::cerr << "[AVISO] Contexto máximo excedido (pos >= max_seq_len)." << std::endl;
+        std::cerr << "[WARNING] Maximum context exceeded (pos >= max_seq_len)." << std::endl;
         return;
     }
 
-    // 1. Salva o Key e Value atuais no KV Cache da camada
+    // 1. Save current Key and Value to the layer's KV Cache
+    // The KV Cache avoids redundant computations by storing previously calculated key and value vectors.
     int kv_size_per_token = num_kv_heads * head_dim;
     int kv_offset = pos * kv_size_per_token;
     
@@ -459,20 +634,22 @@ void execute_attention(std::vector<float>& attn_out,
         kv_cache.v[kv_offset + i] = v_curr[i];
     }
 
-    // 2. Calcula a Atenção Escalonada: Softmax(Q * K_T) * V
+    // 2. Compute Scaled Attention: Softmax(Q * K_T) * V
+    // Scaling stabilizes dot-product magnitudes, preventing vanishing gradients during softmax backpropagation.
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     int num_queries_per_kv = num_heads / num_kv_heads;
 
     std::vector<float> all_scores(num_heads * (pos + 1));
 
     for (int h = 0; h < num_heads; ++h) {
+        // GQA Head Mapping: identify which Key/Value head is shared by this Query head
         int kv_h = h / num_queries_per_kv;
         const float* q_h = q.data() + h * head_dim;
         
         float* scores = all_scores.data() + h * (pos + 1);
         float max_score = -1e9f;
 
-        // Q * K_T (Produto Escalar com todos os tokens passados)
+        // Q * K_T (Dot Product with all historical and current token keys)
         for (int t = 0; t <= pos; ++t) {
             const float* k_h_t = kv_cache.k.data() + (t * kv_size_per_token) + (kv_h * head_dim);
             
@@ -483,12 +660,14 @@ void execute_attention(std::vector<float>& attn_out,
             dot *= scale;
             
             scores[t] = dot;
+            // Track the maximum score for numerical stability in Softmax exponentiation
             if (dot > max_score) {
                 max_score = dot;
             }
         }
 
-        // Softmax
+        // Softmax normalization: exp(x - max_x) / sum(exp(x - max_x))
+        // Subtracting max_score prevents floating-point overflow for large positive dot products.
         float sum_exp = 0.0f;
         for (int t = 0; t <= pos; ++t) {
             scores[t] = std::exp(scores[t] - max_score);
@@ -498,16 +677,17 @@ void execute_attention(std::vector<float>& attn_out,
             scores[t] /= sum_exp;
         }
 
-        // Output = Softmax_Scores * V
+        // Output = Softmax_Scores * V (Weighted sum of token value vectors)
         float* out_h = attn_out.data() + h * head_dim;
 
-        // Inicializa com t = 0 diretamente para evitar std::fill
+        // Initialize directly with t = 0 values to avoid redundant std::fill zeroing calls
         const float* v_h_0 = kv_cache.v.data() + (0 * kv_size_per_token) + (kv_h * head_dim);
         float score_0 = scores[0];
         for (int i = 0; i < head_dim; ++i) {
             out_h[i] = score_0 * v_h_0[i];
         }
 
+        // Accumulate remaining historical token value contributions
         for (int t = 1; t <= pos; ++t) {
             const float* v_h_t = kv_cache.v.data() + (t * kv_size_per_token) + (kv_h * head_dim);
             float score = scores[t];

@@ -8,60 +8,109 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 
+// ============================================================================
+// ARM NEON SIMD ACCELERATED VECTOR OPERATIONS (THEORY & HARDWARE)
+//
+// ARM NEON is an Advanced SIMD (Single Instruction, Multiple Data) architecture
+// extension for ARM-based processors (such as Apple Silicon, Raspberry Pi, and modern
+// mobile chips). It features 128-bit vector registers that can hold:
+//   - 4 single-precision float (32-bit) values,
+//   - 8 half-precision float (16-bit) values (NEON FP16),
+//   - or 16 signed/unsigned 8-bit integer values.
+//
+// By processing multiple data points in parallel within NEON registers, we can 
+// speed up neural network operations like dot products, quantization, and scales
+// dramatically compared to standard scalar loops.
+// ============================================================================
+
 static inline uint8x8_t safe_vld1_u8(const uint8_t* p) {
     uint8x8_t v;
     memcpy(&v, p, 8);
     return v;
 }
 
+// ----------------------------------------------------------------------------
+// neon_dot_q4_q8 (8-Bit Integer Dot Product Helper via NEON intrinsics)
+//
+// Performs a dot product between a 4-bit quantized weight vector and an 8-bit
+// quantized activation vector using 128-bit ARM NEON vector instructions.
+// ----------------------------------------------------------------------------
 static inline int32_t neon_dot_q4_q8(const uint8_t* q, bool high_nibble, const int8_t* xq) {
     int32_t dot = 0;
     for (int i = 0; i < 32; i += 8) {
+        // Load 8 bytes of packed 4-bit weight pairs
         uint8x8_t q8 = safe_vld1_u8(q + i);
+        
+        // Extract the target 4-bit nibbles (either lower 4 bits or upper 4 bits) using shift/mask
         uint8x8_t nib = high_nibble ? vshr_n_u8(q8, 4) : vand_u8(q8, vdup_n_u8(0x0F));
         int8x8_t nib_s = vreinterpret_s8_u8(nib);
+        
+        // Load 8 elements of the 8-bit quantized activation vector
         int8x8_t x8 = vld1_s8(xq + i);
 
+        // Vector multiply: 8-bit * 8-bit -> 16-bit signed vector (prod)
         int16x8_t prod = vmull_s8(nib_s, x8);
+        
+        // Widen 16-bit integers to 32-bit signed integers to avoid overflow during sum
         int32x4_t lo = vmovl_s16(vget_low_s16(prod));
         int32x4_t hi = vmovl_s16(vget_high_s16(prod));
         int32x4_t s = vaddq_s32(lo, hi);
+        
+        // Horizontal sum: reduce the vector of four 32-bit ints to a single scalar dot product value
         int32x2_t s2 = vadd_s32(vget_low_s32(s), vget_high_s32(s));
         dot += vget_lane_s32(s2, 0) + vget_lane_s32(s2, 1);
     }
     return dot;
 }
 
+// ----------------------------------------------------------------------------
+// dot_row_q4_K_q8_K_neon (Main Row-wise Dot Product)
+//
+// Computes the full inner product of one row of Q4_K (256-weight superblocks)
+// against the corresponding Q8_K input activation vector, utilizing the NEON
+// helper above to accelerate computation.
+// ----------------------------------------------------------------------------
 float dot_row_q4_K_q8_K_neon(const block_q4_K* w, const block_q8_K* xq, int num_blocks) {
     float result = 0.0f;
     for (int b = 0; b < num_blocks; ++b) {
         const block_q4_K& wb = w[b];
         const block_q8_K& ab = xq[b];
 
+        // 1. Decode local scales and minimums
+        // Q4_K uses a complex packing for 6-bit local scales and mins. We must 
+        // unpack these into standard 8-bit arrays before applying them.
         uint8_t scales[8];
         uint8_t mins[8];
         for (int g = 0; g < 8; ++g) {
             get_scale_min_k4(g, wb.scales, &scales[g], &mins[g]);
         }
 
+        // 2. Perform NEON accelerated dot product chunk by chunk
         int32_t weighted_dot = 0;
         for (int chunk = 0; chunk < 4; ++chunk) {
             const uint8_t* packed = wb.qs + chunk * 32;
             const int xbase = chunk * 64;
 
+            // Execute vectorized inner dot product twice per chunk (lower nibble then higher nibble)
             int32_t dot_lo = neon_dot_q4_q8(packed, false, ab.qs + xbase);
             int32_t dot_hi = neon_dot_q4_q8(packed, true,  ab.qs + xbase + 32);
 
+            // Scale partial dot products using the unpacked local block scales
             weighted_dot += static_cast<int32_t>(scales[2 * chunk + 0]) * dot_lo;
             weighted_dot += static_cast<int32_t>(scales[2 * chunk + 1]) * dot_hi;
         }
 
+        // 3. Compensate for Q4_K's minimum offsets
+        // To reconstruct correctly (weight = scale * q - min), we must subtract
+        // the sum of (min * activation) over the entire block. The Q8_K format
+        // precalculates 'bsums' (block sums of activations) to make this step O(1).
         int32_t min_dot = 0;
         for (int g = 0; g < 8; ++g) {
             int32_t sum_x = ab.bsums[2 * g + 0] + ab.bsums[2 * g + 1];
             min_dot += static_cast<int32_t>(mins[g]) * sum_x;
         }
 
+        // 4. Combine with the global Float16 scaling factor
         const float xd = ab.d;
         const float wd = fp16_to_fp32(wb.d);
         const float wm = fp16_to_fp32(wb.dmin);
