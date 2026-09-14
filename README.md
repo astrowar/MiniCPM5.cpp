@@ -23,6 +23,7 @@ Built with **zero third-party dependencies** (no PyTorch, Hugging Face, or Pytho
 * **🚀 OpenMP Parallelization:** Fully multi-threaded math loops that scale efficiently across physical CPU cores.
 * **🎲 Stochastic Sampler:** Supports Temperature scaling and Top-p (Nucleus) sampling for creative and coherent text output.
 * **💬 Interactive CLI:** Complete control over prompts, model path, context size, and reasoning `</think>` tags.
+* **🔧 Tool Calling (Function Calling):** A generic, class-based tool system — the model can invoke native C++ tools (e.g. `get_datetime`) mid-conversation; the engine executes them and feeds the result back, running a multi-turn agentic loop. See [Tool Calling](#-tool-calling).
 
 ---
 
@@ -30,14 +31,27 @@ Built with **zero third-party dependencies** (no PyTorch, Hugging Face, or Pytho
 
 ```text
 MiniCPM5.cpp/
-├── CMakeLists.txt         # Dynamic CMake build system
-├── README.md              # This file
+├── CMakeLists.txt              # Dynamic CMake build system
+├── README.md                   # This file
 ├── include/
-│   ├── minicpm_metadata.h # Mapped GGUF tensor offsets & architectural constants
-│   └── ops.h              # Declarations of math kernels & activation functions
+│   ├── minicpm_metadata.h      # Mapped GGUF tensor offsets & architectural constants
+│   ├── minicpm_special_tokens.h # Special / reasoning token definitions
+│   ├── model.h                 # Engine: forward pass, weights, KV cache
+│   ├── tokenizer.h             # GGUF stream tokenizer
+│   ├── chat_template.h         # Chat-template Renderer (prompt formatting)
+│   ├── tool.h                  # Tool-calling: base class, registry, parser
+│   └── ops.h                   # Declarations of math kernels & activation functions
 └── src/
-    ├── main.cpp           # Main generation loop, CLI, and dynamic GGUF Parser
-    └── ops.cpp            # Implementations of GEMV, RMSNorm, RoPE, and GQA
+    ├── main.cpp                # CLI + generation / agentic (tool-calling) loop
+    ├── model.cpp               # Engine forward pass + GGUF tensor loading
+    ├── tokenizer.cpp           # Tokenizer implementation
+    ├── chat_template.cpp       # Chat-template Renderer implementation
+    ├── tool.cpp                # Tool registry dispatch + built-in get_datetime tool
+    ├── omp_config.h            # OpenMP thread-affinity tuning
+    ├── ops.cpp                 # Scalar GEMV, RMSNorm, RoPE, and GQA
+    ├── ops_avx2.cpp            # AVX2/FMA SIMD kernels (auto-enabled on x86)
+    ├── ops_neon.cpp            # NEON SIMD kernels (auto-enabled on ARM)
+    └── ops_internal.h          # Internal kernel helpers
 ```
 
 ---
@@ -182,6 +196,61 @@ Weights are fetched from disk directly in block-quantized structures:
 * **`block_q6_K` (210 bytes for 256 weights):** Unpacks lower 4-bit nibbles and merges them with upper 2-bit masks to reconstruct 6-bit weights.
 
 By keeping these structures compressed in RAM, cache misses are minimized, making the engine extremely competitive on lightweight edge hardware.
+
+---
+
+## 🔧 Tool Calling
+
+The engine supports **function/tool calling**: the model can invoke native C++ tools mid-conversation, and the engine runs a multi-turn **agentic loop** — executing the tool in-process and feeding the result back to the model until it produces a final answer.
+
+Built on a generic, class-based tool system, adding a new tool is as simple as instantiating a subclass (see below).
+
+### How it works
+
+1. Tool definitions are injected into the system prompt via the chat template (`<tools>` block).
+2. Each turn, the engine renders the growing conversation, runs the prompt phase, then decodes **buffering** the output (no token streaming) — tool-call detection needs the full turn.
+3. The buffered output is parsed for a `<function name="...">` block.
+4. **If a tool call is found:** the tool is executed in C++, the assistant turn (with the tool call) and the tool result are appended to the conversation, and the loop repeats.
+5. **If no tool call is found:** the final answer is printed and the loop ends.
+
+The loop is capped at `MAX_TOOL_TURNS = 4`. Re-encoding the prompt from position 0 each turn is safe because the KV cache is positional and the previous turn's output folds back into the next prompt.
+
+### Example
+
+With the default `get_datetime` tool registered, a prompt such as *"What day is it today?"* produces a tool call, the engine runs it, and the model answers on the next turn. In verbose mode you will see the tool call and its result logged, then the final natural-language answer.
+
+### Architecture
+
+Tool-calling lives in its own module (`include/tool.h` / `src/tool.cpp`) so it does not clutter `main.cpp`:
+
+* **`Tool`** — abstract base class. A tool implements `name()`, `execute(args)`, and `definition()` (the JSON schema injected into the prompt).
+* **`ToolRegistry`** — holds tools as `shared_ptr<Tool>` and exposes a templated `add<T>()` (guarded by a `static_assert` that `T` derives from `Tool`), plus `execute(name, args)` dispatch and `definitions()` for prompt injection.
+* **`parse_tool_call()`** — extracts the function name and `<param>` key/value pairs from the model's buffered output.
+* **`main.cpp`** — wires it up: registers tools, feeds `registry.definitions()` into the chat template options, runs the agentic loop, and dispatches each detected call through `registry.execute(...)`.
+
+### Adding a new tool
+
+Derive from `Tool` and register the subclass — no changes to `main.cpp` beyond the `add` call:
+
+```cpp
+class RandomTool : public Tool {
+public:
+    std::string name() const override { return "random"; }
+    std::string execute(const std::vector<std::pair<std::string, std::string>>& args) const override {
+        return std::to_string(/* ... compute ... */);
+    }
+    std::string definition() const override {
+        return "{\"name\": \"random\", \"description\": \"Roll a random number.\", "
+               "\"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}";
+    }
+};
+```
+
+```cpp
+ToolRegistry registry;
+registry.add<GetDateTimeTool>();
+registry.add<RandomTool>();   // <- new tool
+```
 
 ---
 

@@ -2,6 +2,7 @@
 #include "omp_config.h"
 #include "tokenizer.h"
 #include "chat_template.h"
+#include "tool.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -12,7 +13,6 @@
 #include <random>
 #include <algorithm>
 #include <unordered_set>
-#include <ctime>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -87,78 +87,6 @@ int sample_token(const std::vector<float>& logits, float temperature = 1.0f, flo
         if (r <= cur_sum) return probs[i].second;
     }
     return probs.back().second;
-}
-
-// ============================================================================
-// TOOL CALLING: parser do XML emitido pelo modelo + executor nativo
-// ============================================================================
-
-struct ParsedCall {
-    std::string name;
-    std::vector<std::pair<std::string, std::string>> args;
-};
-
-// Remove wrapper CDATA, se presente, do valor de um <param>.
-static std::string strip_cdata(const std::string& v) {
-    const std::string open = "<![CDATA[";
-    const std::string close = "]]>";
-    size_t a = v.find(open);
-    if (a != std::string::npos) {
-        size_t b = v.find(close, a);
-        if (b != std::string::npos)
-            return v.substr(a + open.size(), b - a - open.size());
-    }
-    return v;
-}
-
-// Localiza o primeiro <function name="..."> e extrai name + pares <param>.
-// Retorna name vazio se nenhum <function> for encontrado.
-static ParsedCall parse_tool_call(const std::string& text) {
-    ParsedCall r;
-    size_t f = text.find("<function");
-    if (f == std::string::npos) return r;
-
-    size_t nm = text.find("name=\"", f);
-    if (nm == std::string::npos) return r;
-    nm += 6; // len("name=\"") = 6; o valor comeca no char apos aspas
-    size_t nm_end = text.find('"', nm);
-    if (nm_end == std::string::npos) return r;
-    r.name = text.substr(nm, nm_end - nm);
-
-    size_t pos = nm_end;
-    while (true) {
-        size_t p = text.find("<param", pos);
-        if (p == std::string::npos) break;
-        size_t pk = text.find("name=\"", p);
-        if (pk == std::string::npos) break;
-        pk += 6; // len("name=\"") = 6
-        size_t pk_end = text.find('"', pk);
-        if (pk_end == std::string::npos) break;
-        std::string key = text.substr(pk, pk_end - pk);
-        size_t vs = text.find('>', pk_end);
-        if (vs == std::string::npos) break;
-        vs += 1;
-        size_t ve = text.find("</param>", vs);
-        if (ve == std::string::npos) break;
-        std::string val = text.substr(vs, ve - vs);
-        r.args.emplace_back(key, strip_cdata(val));
-        pos = ve + 8; // len("</param>")
-    }
-    return r;
-}
-
-// Executor nativo da tool get_datetime: devolve a data/hora local atual.
-static std::string exec_get_datetime() {
-    std::time_t now = std::time(nullptr);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    localtime_s(&tm_buf, &now);
-#else
-    localtime_r(&now, &tm_buf);
-#endif
-    char buf[64];
-    std::strftime(buf, sizeof buf, "%A, %Y-%m-%d %H:%M:%S", &tm_buf);
-    return std::string(buf);
 }
 
 // ============================================================================
@@ -279,15 +207,17 @@ int main(int argc, char** argv) {
     chat_template::Options opts;
     opts.add_generation_prompt = true;
     opts.enable_thinking = enable_think;
-    // Definição da tool get_datetime — o renderer injeta isso no system prompt.
-    opts.tools_json = {
-        "{\"name\": \"get_datetime\", \"description\": \"Get the current date and time.\", "
-        "\"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}"
-    };
+    // Tools: instancia no registry. Nova tool = subclasse de Tool + registry.add<T>().
+    // O renderer injeta as definicoes (registry.definitions()) no system prompt.
+    ToolRegistry registry;
+    registry.add<GetDateTimeTool>();
+    std::vector<std::string> tool_defs = registry.definitions();
+    opts.tools_json = tool_defs;
     chat_template::Renderer renderer("<s>");
 
     if (verbose) {
-        std::cout << "\n[Tools] get_datetime available (think=" << (enable_think ? "yes" : "no") << ")." << std::endl;
+        std::cout << "\n[Tools] " << tool_defs.size() << " tool(s) available (think="
+                  << (enable_think ? "yes" : "no") << ")." << std::endl;
     }
 
     std::unordered_set<int> stop_token_ids;
@@ -487,9 +417,7 @@ int main(int argc, char** argv) {
         asst.tool_calls.push_back(tc);
         messages.push_back(std::move(asst));
 
-        std::string result;
-        if (call.name == "get_datetime") result = exec_get_datetime();
-        else result = "{\"error\": \"unknown tool: " + call.name + "\"}";
+        std::string result = registry.execute(call.name, call.args);
         if (verbose) std::cout << "[TOOL RESULT] " << result << std::endl;
 
         chat_template::Message tool_msg;

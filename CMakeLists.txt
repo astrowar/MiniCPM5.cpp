@@ -19,7 +19,7 @@ find_package(OpenMP)
 include_directories(include src otimizacao_scalar)
 
 # Set base sources
-set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp src/chat_template.cpp otimizacao_scalar/ops_scalar_optimized.cpp)
+set(SOURCES src/main.cpp src/model.cpp src/tokenizer.cpp src/ops.cpp src/chat_template.cpp src/tool.cpp otimizacao_scalar/ops_scalar_optimized.cpp)
 set(SIMD_FLAGS "")
 option(MINICPM_ENABLE_AVX2 "Enable AVX2 optimized kernels on x86 targets" ON)
 option(MINICPM_USE_OPENMP_LLVM "Use /openmp:llvm on MSVC when available" ON)
