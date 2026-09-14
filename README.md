@@ -8,7 +8,8 @@ Built with **zero third-party dependencies** (no PyTorch, Hugging Face, or Pytho
 
 ## 🆕 What's New
 
-* **v1.2.0** (Latest) — Improved AVX2 decode kernels (Q4_K/Q6_K/Q8_K path), optimized Q4 metadata decode, fused Gate+Up hot path cleanup, and portable OpenMP thread-affinity tuning via runtime settings (`OMP_PLACES`/`OMP_PROC_BIND`) for Windows/Linux builds.
+* **v1.3.0** (Latest) — **FunctionTool**: register any C++ function or lambda as a tool via `function_traits` (compile-time type deduction, auto-generated JSON schemas). Opt-in `tool_examples/` module with demo tools.
+* **v1.2.0** — Improved AVX2 decode kernels (Q4_K/Q6_K/Q8_K path), optimized Q4 metadata decode, fused Gate+Up hot path cleanup, and portable OpenMP thread-affinity tuning via runtime settings (`OMP_PLACES`/`OMP_PROC_BIND`) for Windows/Linux builds.
 * **v1.0.0** — Initial release: full GGUF parser, Q4_K/Q6_K/Q8_0 dequantization, GQA with KV cache, RoPE embeddings, SwiGLU activations, temperature + top-p sampling, and an interactive CLI with `</think>` reasoning tag support.
 
 ---
@@ -23,7 +24,7 @@ Built with **zero third-party dependencies** (no PyTorch, Hugging Face, or Pytho
 * **🚀 OpenMP Parallelization:** Fully multi-threaded math loops that scale efficiently across physical CPU cores.
 * **🎲 Stochastic Sampler:** Supports Temperature scaling and Top-p (Nucleus) sampling for creative and coherent text output.
 * **💬 Interactive CLI:** Complete control over prompts, model path, context size, and reasoning `</think>` tags.
-* **🔧 Tool Calling (Function Calling):** A generic, class-based tool system — the model can invoke native C++ tools (e.g. `get_datetime`) mid-conversation; the engine executes them and feeds the result back, running a multi-turn agentic loop. See [Tool Calling](#-tool-calling).
+* **🔧 Tool Calling (Function Calling):** Register any C++ function or lambda as a tool — the model invokes it mid-conversation, the engine executes it in-process and feeds the result back, running a multi-turn agentic loop. See [Tool Calling](#-tool-calling).
 
 ---
 
@@ -39,14 +40,18 @@ MiniCPM5.cpp/
 │   ├── model.h                 # Engine: forward pass, weights, KV cache
 │   ├── tokenizer.h             # GGUF stream tokenizer
 │   ├── chat_template.h         # Chat-template Renderer (prompt formatting)
-│   ├── tool.h                  # Tool-calling: base class, registry, parser
+│   ├── tool.h                  # Tool-calling: Tool base, registry, parser
+│   ├── tool_function.h         # FunctionTool: register lambdas/functions as tools
 │   └── ops.h                   # Declarations of math kernels & activation functions
+├── tool_examples/
+│   ├── examples.h              # register_example_tools() — opt-in demo tools
+│   └── examples.cpp            # get_datetime, add, multiply, sqrt (lambdas)
 └── src/
     ├── main.cpp                # CLI + generation / agentic (tool-calling) loop
     ├── model.cpp               # Engine forward pass + GGUF tensor loading
     ├── tokenizer.cpp           # Tokenizer implementation
     ├── chat_template.cpp       # Chat-template Renderer implementation
-    ├── tool.cpp                # Tool registry dispatch + built-in get_datetime tool
+    ├── tool.cpp                # Tool registry dispatch + XML parser
     ├── omp_config.h            # OpenMP thread-affinity tuning
     ├── ops.cpp                 # Scalar GEMV, RMSNorm, RoPE, and GQA
     ├── ops_avx2.cpp            # AVX2/FMA SIMD kernels (auto-enabled on x86)
@@ -201,55 +206,106 @@ By keeping these structures compressed in RAM, cache misses are minimized, makin
 
 ## 🔧 Tool Calling
 
-The engine supports **function/tool calling**: the model can invoke native C++ tools mid-conversation, and the engine runs a multi-turn **agentic loop** — executing the tool in-process and feeding the result back to the model until it produces a final answer.
-
-Built on a generic, class-based tool system, adding a new tool is as simple as instantiating a subclass (see below).
+The engine supports **function/tool calling**: register any C++ function or lambda, and the model can invoke it mid-conversation. The engine runs a multi-turn **agentic loop** — executing the tool in-process and feeding the result back to the model until it produces a final answer.
 
 ### How it works
 
-1. Tool definitions are injected into the system prompt via the chat template (`<tools>` block).
+1. Tool definitions (auto-generated JSON schemas) are injected into the system prompt via the chat template (`<tools>` block).
 2. Each turn, the engine renders the growing conversation, runs the prompt phase, then decodes **buffering** the output (no token streaming) — tool-call detection needs the full turn.
 3. The buffered output is parsed for a `<function name="...">` block.
 4. **If a tool call is found:** the tool is executed in C++, the assistant turn (with the tool call) and the tool result are appended to the conversation, and the loop repeats.
 5. **If no tool call is found:** the final answer is printed and the loop ends.
 
-The loop is capped at `MAX_TOOL_TURNS = 4`. Re-encoding the prompt from position 0 each turn is safe because the KV cache is positional and the previous turn's output folds back into the next prompt.
+The loop is capped at `MAX_TOOL_TURNS = 4`.
 
-### Example
+### Adding a tool
 
-With the default `get_datetime` tool registered, a prompt such as *"What day is it today?"* produces a tool call, the engine runs it, and the model answers on the next turn. In verbose mode you will see the tool call and its result logged, then the final natural-language answer.
+Tools are registered with `registry.add_function()`. The C++ type system (`function_traits`) **deduces argument types at compile time** — you only provide names and descriptions:
+
+```cpp
+#include "tool_function.h"
+
+ToolRegistry registry;
+
+// Lambda with typed arguments — types are auto-detected
+registry.add_function("add", "Adds two numbers",
+    [](double a, double b) { return a + b; },
+    { TOOL_ARG(a, "First number"), TOOL_ARG(b, "Second number") });
+
+// Works with free functions too
+int factorial(int n) { return n <= 1 ? 1 : n * factorial(n - 1); }
+registry.add_function("factorial", "Computes n!", factorial,
+    { TOOL_ARG(n, "Non-negative integer") });
+
+// Zero-argument tools
+registry.add_function("get_datetime", "Get the current date and time",
+    []() -> std::string { /* ... */ },
+    {});
+```
+
+The generated JSON schema for the `add` tool:
+
+```json
+{
+  "name": "add",
+  "description": "Adds two numbers",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "a": { "type": "number", "description": "First number" },
+      "b": { "type": "number", "description": "Second number" }
+    },
+    "required": ["a", "b"]
+  }
+}
+```
+
+### Supported types
+
+| C++ type | JSON Schema | Parsed via |
+|----------|-------------|------------|
+| `int`, `long` | `integer` | `std::stoi` / `std::stol` |
+| `float`, `double` | `number` | `std::stof` / `std::stod` |
+| `bool` | `boolean` | `"true"` / `"1"` |
+| `std::string` | `string` | passthrough |
+
+Return types are auto-converted to string (`std::to_string`, `"%g"` for floats, or raw string).
 
 ### Architecture
 
-Tool-calling lives in its own module (`include/tool.h` / `src/tool.cpp`) so it does not clutter `main.cpp`:
+* **`include/tool.h`** — `Tool` (abstract base), `ToolRegistry` (registry + dispatch), `ToolParam`, `TOOL_ARG` macro, `parse_tool_call()`.
+* **`include/tool_function.h`** — `function_traits`, `FunctionTool<F>` adapter, `json_type<T>`, `parse_tool_value<T>`, `invoke_function`. All header-only (C++17 templates).
+* **`tool_examples/`** — opt-in demo tools (`get_datetime`, `add`, `multiply`, `sqrt`). Not part of the default build.
+* **`src/tool.cpp`** — XML parser + registry dispatch implementation.
 
-* **`Tool`** — abstract base class. A tool implements `name()`, `execute(args)`, and `definition()` (the JSON schema injected into the prompt).
-* **`ToolRegistry`** — holds tools as `shared_ptr<Tool>` and exposes a templated `add<T>()` (guarded by a `static_assert` that `T` derives from `Tool`), plus `execute(name, args)` dispatch and `definitions()` for prompt injection.
-* **`parse_tool_call()`** — extracts the function name and `<param>` key/value pairs from the model's buffered output.
-* **`main.cpp`** — wires it up: registers tools, feeds `registry.definitions()` into the chat template options, runs the agentic loop, and dispatches each detected call through `registry.execute(...)`.
+### Enabling tools
 
-### Adding a new tool
+The default build ships with **zero tools**. To enable the examples:
 
-Derive from `Tool` and register the subclass — no changes to `main.cpp` beyond the `add` call:
-
-```cpp
-class RandomTool : public Tool {
-public:
-    std::string name() const override { return "random"; }
-    std::string execute(const std::vector<std::pair<std::string, std::string>>& args) const override {
-        return std::to_string(/* ... compute ... */);
-    }
-    std::string definition() const override {
-        return "{\"name\": \"random\", \"description\": \"Roll a random number.\", "
-               "\"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}";
-    }
-};
+```cmake
+# CMakeLists.txt
+set(SOURCES ... tool_examples/examples.cpp)
 ```
 
 ```cpp
+// main.cpp
+#include "tool_function.h"
+#include "tool_examples/examples.h"
+
 ToolRegistry registry;
-registry.add<GetDateTimeTool>();
-registry.add<RandomTool>();   // <- new tool
+register_example_tools(registry);  // get_datetime + add + multiply + sqrt
+```
+
+Or register your own functions directly (see examples above) — no additional files needed.
+
+### Example session
+
+With tools registered, a prompt like *"What is 15 + 27?"* triggers:
+
+```
+[TOOL CALL] add  a=15.0  b=27.0
+[TOOL RESULT] 42
+The result of 15 + 27 is 42.
 ```
 
 ---
