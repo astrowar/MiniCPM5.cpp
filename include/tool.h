@@ -9,12 +9,7 @@
 // ============================================================================
 // TOOL CALLING: infraestrutura generica de tools para o motor
 //
-// Nova tool = subclasse de Tool + instancia no ToolRegistry:
-//     class MinhaTool : public Tool { ... };
-//     ToolRegistry registry;
-//     registry.add<MinhaTool>();
-//
-// Ou registre uma funcao comum diretamente (ver tool_function.h):
+// Registre uma funcao/lambda como tool (ver tool_function.h):
 //     registry.add_function("add", "Adds two integers", add, {
 //         TOOL_ARG(a, "First integer"),
 //         TOOL_ARG(b, "Second integer")
@@ -60,8 +55,7 @@ template<typename F> class FunctionTool;
 // Registro/dispensador de tools: mapeia name -> Tool.
 class ToolRegistry {
 public:
-    // Inclusao via instancia: registry.add<GetDateTimeTool>();
-    // Com argumentos de construtor: registry.add<MinhaTool>("cfg", 42);
+    // Registro generico de Tool derivado (uso interno).
     template <typename T, typename... Args>
     void add(Args&&... args) {
         static_assert(std::is_base_of<Tool, T>::value, "T deve derivar de Tool");
