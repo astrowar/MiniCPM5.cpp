@@ -115,7 +115,8 @@ int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
 #endif
 
-    std::string text_prompt = "O Brasil é um país";
+    std::string text_prompt;
+    bool interactive = false;
     bool enable_think = false;
     std::string model_path = "MiniCPM5-2B-Q4_K_M.gguf";
     int context_size = 8192;
@@ -130,7 +131,7 @@ int main(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ./minicpm5-cli [options]\n"
                       << "Options:\n"
-                      << "  --text \"...\"      Input prompt text (default: \"O Brasil é um país\")\n"
+                      << "  --text \"...\"      Input prompt text (omit for interactive mode)\n"
                       << "  -m <path>         Path to GGUF model\n"
                       << "  -c <size>         Context size (default: 8192)\n"
                       << "  -n <count>        Max generation tokens (default: 1024)\n"
@@ -156,10 +157,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Sem --text => modo interativo (REPL)
+    if (text_prompt.empty()) {
+        interactive = true;
+    }
+
     if (verbose) {
         std::cout << "=== MiniCPM5 (2B) C++ High-Level Inference Engine ===" << std::endl;
         std::cout << "[Config] Model: " << model_path << std::endl;
-        std::cout << "[Config] Prompt: " << text_prompt << std::endl;
+        std::cout << "[Config] Mode: " << (interactive ? "interactive (REPL)" : "single-shot") << std::endl;
+        if (!interactive) std::cout << "[Config] Prompt: " << text_prompt << std::endl;
         std::cout << "[Config] Context size: " << context_size << std::endl;
         std::cout << "[Config] Max gen tokens: " << max_gen_tokens << std::endl;
         std::cout << "[Config] Think mode: " << (enable_think ? "enabled" : "disabled") << std::endl;
@@ -207,18 +214,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ---- Conversa inicial: system (com tools) + user ----
+    // ---- Conversa: system (com tools) + turno(s) do usuario ----
     std::vector<chat_template::Message> messages;
 
     chat_template::Message sys_msg;
     sys_msg.role = "system";
     sys_msg.content = "You are a helpful assistant. Use the provided tools when they help answer the user.";
     messages.push_back(std::move(sys_msg));
-
-    chat_template::Message user_msg;
-    user_msg.role = "user";
-    user_msg.content = text_prompt;
-    messages.push_back(std::move(user_msg));
 
     chat_template::Options opts;
     opts.add_generation_prompt = true;
@@ -314,156 +316,180 @@ int main(int argc, char** argv) {
     }
 
     // ========================================================================
-    // LOOP AGENTICO
-    // A cada turno: renderiza a conversa (crescente), decodifica bufferizando,
-    // e detecta <function> na saida. Se houver tool call: executa em C++,
-    // anexa o resultado como mensagem "tool" e repete. Sem tool call: imprime
-    // a resposta final e encerra.
-    //
-    // Re-encodar o prompt do zero a cada turno e seguro: o KV cache e
-    // posicional (offset = pos * kv_len) e a atencao le [0, pos]; cada
-    // posicao e reescrita no momento em que vira o pos atual, e a saida do
-    // turno anterior volta a fazer parte do prompt seguinte.
+    // LOOP AGENTICO (lambda reutilizavel para single-shot e interactive)
     // ========================================================================
     constexpr int MAX_TOOL_TURNS = 4;
-    double total_prompt_time = 0.0, total_gen_time = 0.0;
-    double total_prompt_tokens = 0.0, total_gen_tokens = 0.0;
-    int num_turns = 0;
 
-    for (int turn = 0; turn < MAX_TOOL_TURNS; ++turn) {
-        num_turns++;
+    auto run_conversation = [&]() -> bool {
+        double prompt_time = 0.0, gen_time = 0.0;
+        double p_tokens = 0.0, g_tokens = 0.0;
+        int num_turns = 0;
 
-        std::string full_prompt = renderer.render(messages, opts);
-        if (verbose) {
-            std::cout << "\n[Turn " << turn << "] Applying chat template..." << std::endl;
-            std::cout << "[Prompt Raw]\n" << full_prompt << "\n" << std::endl;
-        }
+        for (int turn = 0; turn < MAX_TOOL_TURNS; ++turn) {
+            num_turns++;
 
-        std::vector<int> prompt_tokens = tokenizer.tokenize(full_prompt);
-        if (prompt_tokens.empty()) {
-            std::cerr << "[Error] Prompt tokenization produced zero tokens." << std::endl;
-            return 1;
-        }
-        if ((int)prompt_tokens.size() >= context_size) {
-            std::cerr << "[Error] Context overflow: " << prompt_tokens.size()
-                      << " prompt tokens >= context_size " << context_size << std::endl;
-            break;
-        }
-        if (verbose) {
-            std::cout << "[Turn " << turn << "] " << prompt_tokens.size() << " prompt tokens." << std::endl;
-        }
-
-        // Estado por turno
-        think_buf.clear();
-        main_buf.clear();
-        in_thinking = false;
-
-        // ---- Prompt phase ----
-        auto t0 = std::chrono::high_resolution_clock::now();
-        int next_token = -1;
-        for (size_t pos = 0; pos < prompt_tokens.size(); ++pos) {
-            int token_id = prompt_tokens[pos];
-            const std::vector<float>& logits = engine.forward(token_id, (int)pos, context_size);
-            if (pos == prompt_tokens.size() - 1) {
-                next_token = sample_token(logits, temperature, 0.95f);
+            std::string full_prompt = renderer.render(messages, opts);
+            if (verbose) {
+                std::cout << "\n[Turn " << turn << "] Applying chat template..." << std::endl;
+                std::cout << "[Prompt Raw]\n" << full_prompt << "\n" << std::endl;
             }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        total_prompt_time += std::chrono::duration<double>(t1 - t0).count();
-        total_prompt_tokens += (double)prompt_tokens.size();
 
-        // Primeiro token gerado (previsto pelo ultimo token do prompt).
-        if (!is_stop_token(next_token)) {
-            // O template ja colocou /think no prompt, entao o modelo comeca a
-            // gerar o raciocinio direto; pre-entra no modo think para o buffer
-            // rotear para o lugar certo.
-            if (enable_think && !in_thinking) in_thinking = true;
-            buffer_token(next_token);
-        }
+            std::vector<int> prompt_tokens = tokenizer.tokenize(full_prompt);
+            if (prompt_tokens.empty()) {
+                std::cerr << "[Error] Prompt tokenization produced zero tokens." << std::endl;
+                return false;
+            }
+            if ((int)prompt_tokens.size() >= context_size) {
+                std::cerr << "[Error] Context overflow: " << prompt_tokens.size()
+                          << " prompt tokens >= context_size " << context_size << std::endl;
+                return false;
+            }
+            if (verbose) {
+                std::cout << "[Turn " << turn << "] " << prompt_tokens.size() << " prompt tokens." << std::endl;
+            }
 
-        // ---- Decode autoregressivo (bufferizado) ----
-        auto t2 = std::chrono::high_resolution_clock::now();
-        int current_pos = (int)prompt_tokens.size();
-        int turn_gen = 0;
-        for (int step = 0; step < max_gen_tokens && !is_stop_token(next_token); step++) {
-            const std::vector<float>& logits = engine.forward(next_token, current_pos, context_size);
-            next_token = sample_token(logits, temperature, 0.95f);
-            current_pos++;
+            // Estado por turno
+            think_buf.clear();
+            main_buf.clear();
+            in_thinking = false;
 
-            if (is_stop_token(next_token)) {
-                if (verbose) std::cout << "[Turn " << turn << "] EOS token (id=" << next_token << ")." << std::endl;
+            // ---- Prompt phase ----
+            auto t0 = std::chrono::high_resolution_clock::now();
+            int next_token = -1;
+            for (size_t pos = 0; pos < prompt_tokens.size(); ++pos) {
+                int token_id = prompt_tokens[pos];
+                const std::vector<float>& logits = engine.forward(token_id, (int)pos, context_size);
+                if (pos == prompt_tokens.size() - 1) {
+                    next_token = sample_token(logits, temperature, 0.95f);
+                }
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            prompt_time += std::chrono::duration<double>(t1 - t0).count();
+            p_tokens += (double)prompt_tokens.size();
+
+            // Primeiro token gerado
+            if (!is_stop_token(next_token)) {
+                if (enable_think && !in_thinking) in_thinking = true;
+                buffer_token(next_token);
+            }
+
+            // ---- Decode autoregressivo (bufferizado) ----
+            auto t2 = std::chrono::high_resolution_clock::now();
+            int current_pos = (int)prompt_tokens.size();
+            int turn_gen = 0;
+            for (int step = 0; step < max_gen_tokens && !is_stop_token(next_token); step++) {
+                const std::vector<float>& logits = engine.forward(next_token, current_pos, context_size);
+                next_token = sample_token(logits, temperature, 0.95f);
+                current_pos++;
+
+                if (is_stop_token(next_token)) {
+                    if (verbose) std::cout << "[Turn " << turn << "] EOS token (id=" << next_token << ")." << std::endl;
+                    break;
+                }
+                buffer_token(next_token);
+                turn_gen++;
+            }
+            auto t3 = std::chrono::high_resolution_clock::now();
+            gen_time += std::chrono::duration<double>(t3 - t2).count();
+            g_tokens += (double)turn_gen;
+
+            if (verbose) {
+                std::cout << "[Turn " << turn << "] Generated " << turn_gen << " tokens." << std::endl;
+                if (!think_buf.empty()) std::cout << "[Turn " << turn << "] Reasoning: " << think_buf << std::endl;
+                std::cout << "[Turn " << turn << "] Raw output: " << main_buf << std::endl;
+            }
+
+            // ---- Decisao: tool call ou resposta final? ----
+            ParsedCall call = parse_tool_call(main_buf);
+            if (call.name.empty()) {
+                // Resposta final
+                if (verbose && !think_buf.empty()) std::cout << "\n[Final] " << std::endl;
+                std::cout << main_buf << std::flush;
+
+                // Preserva na conversa (para contexto multi-turno no modo REPL)
+                chat_template::Message asst;
+                asst.role = "assistant";
+                asst.content = main_buf;
+                if (!think_buf.empty()) asst.reasoning_content = think_buf;
+                messages.push_back(std::move(asst));
                 break;
             }
-            buffer_token(next_token);
-            turn_gen++;
+
+            // Tool call
+            if (verbose) {
+                std::cout << "\n[TOOL CALL] " << call.name;
+                for (const auto& kv : call.args) std::cout << "  " << kv.first << "=" << kv.second;
+                std::cout << std::endl;
+            }
+
+            chat_template::Message asst;
+            asst.role = "assistant";
+            asst.content = "";
+            if (!think_buf.empty()) asst.reasoning_content = think_buf;
+            chat_template::ToolCall tc;
+            tc.name = call.name;
+            tc.arguments = call.args;
+            asst.tool_calls.push_back(tc);
+            messages.push_back(std::move(asst));
+
+            std::string result = registry.execute(call.name, call.args);
+            if (verbose) std::cout << "[TOOL RESULT] " << result << std::endl;
+
+            chat_template::Message tool_msg;
+            tool_msg.role = "tool";
+            tool_msg.content = result;
+            messages.push_back(std::move(tool_msg));
         }
-        auto t3 = std::chrono::high_resolution_clock::now();
-        total_gen_time += std::chrono::duration<double>(t3 - t2).count();
-        total_gen_tokens += (double)turn_gen;
+
+        if (num_turns >= MAX_TOOL_TURNS) {
+            std::cerr << "\n[Warn] Max tool turns (" << MAX_TOOL_TURNS << ") reached." << std::endl;
+        }
+
+        // Performance
+        double prompt_tok_s = (prompt_time > 0) ? (p_tokens / prompt_time) : 0.0;
+        double gen_tok_s = (gen_time > 0) ? (g_tokens / gen_time) : 0.0;
 
         if (verbose) {
-            std::cout << "[Turn " << turn << "] Generated " << turn_gen << " tokens." << std::endl;
-            if (!think_buf.empty()) std::cout << "[Turn " << turn << "] Reasoning: " << think_buf << std::endl;
-            std::cout << "[Turn " << turn << "] Raw output: " << main_buf << std::endl;
+            std::cout << "\n=== Performance (" << num_turns << " turnos) ===" << std::endl;
+            std::cout << "Prompt: " << (size_t)p_tokens << " tok / "
+                      << std::fixed << std::setprecision(2) << prompt_time << "s"
+                      << " (" << std::setprecision(1) << prompt_tok_s << " tok/s)" << std::endl;
+            std::cout << "Gen:    " << (size_t)g_tokens << " tok / "
+                      << std::fixed << std::setprecision(2) << gen_time << "s"
+                      << " (" << std::setprecision(1) << gen_tok_s << " tok/s)" << std::endl;
+        } else {
+            std::cout << "\n" << std::fixed << std::setprecision(1)
+                      << "  " << (size_t)g_tokens << " tok em "
+                      << std::setprecision(2) << (prompt_time + gen_time) << "s"
+                      << "  (" << num_turns << " turno(s))" << std::endl;
         }
+        return true;
+    };
 
-        // ---- Decisao: tool call ou resposta final? ----
-        ParsedCall call = parse_tool_call(main_buf);
-        if (call.name.empty()) {
-            // Resposta final: imprime e encerra.
-            if (verbose && !think_buf.empty()) std::cout << "\n[Final] " << std::endl;
-            std::cout << main_buf << std::flush;
-            break;
+    // ========================================================================
+    // DISPATCH: single-shot ou interactive REPL
+    // ========================================================================
+    if (interactive) {
+        std::string line;
+        while (true) {
+            std::cout << "> " << std::flush;
+            if (!std::getline(std::cin, line)) break;
+            if (line.empty()) continue;
+
+            chat_template::Message user_msg;
+            user_msg.role = "user";
+            user_msg.content = line;
+            messages.push_back(std::move(user_msg));
+
+            if (!run_conversation()) break;
         }
-
-        // Tool call: registra o turno do assistant e executa a tool em C++.
-        if (verbose) {
-            std::cout << "\n[TOOL CALL] " << call.name;
-            for (const auto& kv : call.args) std::cout << "  " << kv.first << "=" << kv.second;
-            std::cout << std::endl;
-        }
-
-        chat_template::Message asst;
-        asst.role = "assistant";
-        asst.content = "";  // o XML <function> e reconstruido a partir de tool_calls
-        if (!think_buf.empty()) asst.reasoning_content = think_buf;
-        chat_template::ToolCall tc;
-        tc.name = call.name;
-        tc.arguments = call.args;
-        asst.tool_calls.push_back(tc);
-        messages.push_back(std::move(asst));
-
-        std::string result = registry.execute(call.name, call.args);
-        if (verbose) std::cout << "[TOOL RESULT] " << result << std::endl;
-
-        chat_template::Message tool_msg;
-        tool_msg.role = "tool";
-        tool_msg.content = result;
-        messages.push_back(std::move(tool_msg));
-        // -> proxima iteracao re-renderiza com o resultado da tool no contexto
-    }
-
-    if (num_turns >= MAX_TOOL_TURNS) {
-        std::cerr << "\n[Warn] Max tool turns (" << MAX_TOOL_TURNS << ") reached." << std::endl;
-    }
-
-    // ---- Summary de desempenho (soma dos turnos) ----
-    double prompt_tok_s = (total_prompt_time > 0) ? (total_prompt_tokens / total_prompt_time) : 0.0;
-    double gen_tok_s = (total_gen_time > 0) ? (total_gen_tokens / total_gen_time) : 0.0;
-
-    if (verbose) {
-        std::cout << "\n\n=== Performance Summary (" << num_turns << " turnos) ===" << std::endl;
-        std::cout << "Prompt phase: " << (size_t)total_prompt_tokens << " tokens in "
-                  << std::fixed << std::setprecision(2) << total_prompt_time << " s"
-                  << " (" << std::setprecision(1) << prompt_tok_s << " tok/s)" << std::endl;
-        std::cout << "Generation:   " << (size_t)total_gen_tokens << " tokens in "
-                  << std::fixed << std::setprecision(2) << total_gen_time << " s"
-                  << " (" << std::setprecision(1) << gen_tok_s << " tok/s)" << std::endl;
     } else {
-        std::cout << "\n" << std::fixed << std::setprecision(1)
-                  << "  " << (size_t)total_gen_tokens << " tokens em "
-                  << std::setprecision(2) << (total_prompt_time + total_gen_time) << "s"
-                  << "  (" << num_turns << " turno(s))" << std::endl;
+        chat_template::Message user_msg;
+        user_msg.role = "user";
+        user_msg.content = text_prompt;
+        messages.push_back(std::move(user_msg));
+
+        run_conversation();
     }
 
     return 0;
