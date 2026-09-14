@@ -218,4 +218,104 @@ void quantize_row_q8_K_neon(const float* x, block_q8_K* y, int n) {
         }
     }
 }
-#endif
+// ----------------------------------------------------------------------------
+// OPENMP WRAPPERS (Unified GEMV API for Dispatcher)
+//
+// These functions provide a uniform interface compatible with the AVX2 variants.
+// They handle the parallel #pragma omp loops across the matrix rows, calling the
+// optimized dot_row_ helpers above for each thread.
+// ----------------------------------------------------------------------------
+void gemv_q4_K_q8_K_neon(const char* matrix_weights, const block_q8_K* xq, float* out, int num_rows, int num_cols) {
+    const block_q4_K* blocks = reinterpret_cast<const block_q4_K*>(matrix_weights);
+    int nb = num_cols / QK_K;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < num_rows; ++r) {
+        out[r] = dot_row_q4_K_q8_K_neon(blocks + r * nb, xq, nb);
+    }
+}
+
+void gemv_q6_K_q8_K_neon(const char* matrix_weights, const block_q8_K* xq, float* out, int num_rows, int num_cols) {
+    const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(matrix_weights);
+    int nb = num_cols / QK_K;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < num_rows; ++r) {
+        out[r] = dot_row_q6_K_q8_K_neon(blocks + r * nb, xq, nb);
+    }
+}
+
+void gemv_qkv_q4_K_q8_K_neon(const char* wq, const char* wk, const char* wv,
+                             const block_q8_K* xq, float* q, float* k, float* v,
+                             int q_rows, int kv_rows, int num_cols) {
+    const block_q4_K* bq = reinterpret_cast<const block_q4_K*>(wq);
+    const block_q4_K* bk = reinterpret_cast<const block_q4_K*>(wk);
+    const block_q4_K* bv = reinterpret_cast<const block_q4_K*>(wv);
+    int nb = num_cols / QK_K;
+    int total = q_rows + kv_rows + kv_rows;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < total; ++r) {
+        if (r < q_rows) {
+            q[r] = dot_row_q4_K_q8_K_neon(bq + r * nb, xq, nb);
+        } else if (r < q_rows + kv_rows) {
+            int kr = r - q_rows;
+            k[kr] = dot_row_q4_K_q8_K_neon(bk + kr * nb, xq, nb);
+        } else {
+            int vr = r - q_rows - kv_rows;
+            v[vr] = dot_row_q4_K_q8_K_neon(bv + vr * nb, xq, nb);
+        }
+    }
+}
+
+void gemv_qkv_q4_q4_q6_q8_K_neon(const char* wq, const char* wk, const char* wv,
+                                 const block_q8_K* xq, float* q, float* k, float* v,
+                                 int q_rows, int kv_rows, int num_cols) {
+    const block_q4_K* bq = reinterpret_cast<const block_q4_K*>(wq);
+    const block_q4_K* bk = reinterpret_cast<const block_q4_K*>(wk);
+    const block_q6_K* bv = reinterpret_cast<const block_q6_K*>(wv);
+    int nb = num_cols / QK_K;
+    int total = q_rows + kv_rows + kv_rows;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < total; ++r) {
+        if (r < q_rows) {
+            q[r] = dot_row_q4_K_q8_K_neon(bq + r * nb, xq, nb);
+        } else if (r < q_rows + kv_rows) {
+            int kr = r - q_rows;
+            k[kr] = dot_row_q4_K_q8_K_neon(bk + kr * nb, xq, nb);
+        } else {
+            int vr = r - q_rows - kv_rows;
+            v[vr] = dot_row_q6_K_q8_K_neon(bv + vr * nb, xq, nb);
+        }
+    }
+}
+
+void gemv_gate_up_q4_K_q8_K_neon(const char* w_gate, const char* w_up,
+                                 const block_q8_K* xq, float* gate, float* up,
+                                 int num_rows, int num_cols) {
+    const block_q4_K* bg = reinterpret_cast<const block_q4_K*>(w_gate);
+    const block_q4_K* bu = reinterpret_cast<const block_q4_K*>(w_up);
+    int nb = num_cols / QK_K;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < num_rows; ++r) {
+        // NEON does not currently fuse gate+up at the vector level like AVX2 does,
+        // so we call them sequentially per row.
+        gate[r] = dot_row_q4_K_q8_K_neon(bg + r * nb, xq, nb);
+        up[r]   = dot_row_q4_K_q8_K_neon(bu + r * nb, xq, nb);
+    }
+}
+
+// Thread-local scratch buffer for non-pre-quantized gemvs
+static thread_local std::vector<block_q8_K> neon_q8_scratch;
+static inline const block_q8_K* prepare_q8_neon(const float* x, int num_cols) {
+    neon_q8_scratch.resize(num_cols / QK_K);
+    quantize_row_q8_K_neon(x, neon_q8_scratch.data(), num_cols);
+    return neon_q8_scratch.data();
+}
+
+void gemv_q4_K_neon(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+    gemv_q4_K_q8_K_neon(matrix_weights, prepare_q8_neon(x, num_cols), out, num_rows, num_cols);
+}
+
+void gemv_q6_K_neon(const char* matrix_weights, const float* x, float* out, int num_rows, int num_cols) {
+    gemv_q6_K_q8_K_neon(matrix_weights, prepare_q8_neon(x, num_cols), out, num_rows, num_cols);
+}
+
+#endif // __ARM_NEON

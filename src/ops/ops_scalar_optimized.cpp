@@ -1,15 +1,44 @@
-#include "ops_scalar_optimized.h"
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include "ops_internal.h"
 
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
+
+// =============================================================================
+// INTERNAL SCALAR STRUCTURES
+// =============================================================================
+
+enum class KQuantType {
+    Q4_K,
+    Q6_K,
+};
+
+struct QuantMatrixK {
+    const char* data = nullptr;
+    int rows = 0;
+    int cols = 0;
+    KQuantType type = KQuantType::Q4_K;
+};
+
+// Reusable activation workspace. Keep one of these in the engine (or one per
+// worker/thread if the scheduling model requires it) to avoid allocations.
+struct Q8KWorkspace {
+    std::vector<block_q8_K> blocks;
+
+    block_q8_K* resize_for(int n) {
+        assert(n > 0);
+        assert(n % QK_K == 0);
+        blocks.resize(static_cast<std::size_t>(n / QK_K));
+        return blocks.data();
+    }
+    const block_q8_K* data() const { return blocks.data(); }
+};
 
 // =============================================================================
 // PORTABLE SCALAR REFERENCE FOR Q4_K/Q6_K x Q8_K
@@ -56,36 +85,7 @@ inline int8_t quantize_q8_value(float x, float inv_d) {
     return static_cast<int8_t>(q);
 }
 
-inline float dot_matrix_row_q8_scalar(
-    const QuantMatrixK& matrix,
-    const block_q8_K* xq,
-    int row) {
-
-    assert(matrix.data != nullptr);
-    assert(matrix.cols > 0 && matrix.cols % QK_K == 0);
-    assert(row >= 0 && row < matrix.rows);
-
-    const int nb = matrix.cols / QK_K;
-
-    if (matrix.type == KQuantType::Q4_K) {
-        const auto* blocks = reinterpret_cast<const block_q4_K*>(matrix.data);
-        return dot_row_q4_K_q8_K_scalar(
-            blocks + static_cast<std::size_t>(row) * nb, xq, nb);
-    }
-
-    const auto* blocks = reinterpret_cast<const block_q6_K*>(matrix.data);
-    return dot_row_q6_K_q8_K_scalar(
-        blocks + static_cast<std::size_t>(row) * nb, xq, nb);
-}
-
 } // namespace
-
-block_q8_K* Q8KWorkspace::resize_for(int n) {
-    assert(n > 0);
-    assert(n % QK_K == 0);
-    blocks.resize(static_cast<std::size_t>(n / QK_K));
-    return blocks.data();
-}
 
 // =============================================================================
 // 1. FP32 -> Q8_K
@@ -453,6 +453,30 @@ void gemv_q6_K_q8_K_scalar(
             blocks + static_cast<std::size_t>(r) * nb, xq, nb);
     }
 }
+
+namespace {
+inline float dot_matrix_row_q8_scalar(
+    const QuantMatrixK& matrix,
+    const block_q8_K* xq,
+    int row) {
+
+    assert(matrix.data != nullptr);
+    assert(matrix.cols > 0 && matrix.cols % QK_K == 0);
+    assert(row >= 0 && row < matrix.rows);
+
+    const int nb = matrix.cols / QK_K;
+
+    if (matrix.type == KQuantType::Q4_K) {
+        const auto* blocks = reinterpret_cast<const block_q4_K*>(matrix.data);
+        return dot_row_q4_K_q8_K_scalar(
+            blocks + static_cast<std::size_t>(row) * nb, xq, nb);
+    }
+
+    const auto* blocks = reinterpret_cast<const block_q6_K*>(matrix.data);
+    return dot_row_q6_K_q8_K_scalar(
+        blocks + static_cast<std::size_t>(row) * nb, xq, nb);
+}
+} // namespace
 
 void gemv_k_q8_K_scalar(
     const QuantMatrixK& matrix,

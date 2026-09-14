@@ -3,9 +3,104 @@
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "ops_internal.h"
 
-// Estrutura Base de um Tensor
+// ============================================================================
+// GGML TENSOR MEMORY LAYOUTS & UTILITIES
+// ============================================================================
+
+typedef uint16_t ggml_fp16_t;
+
+// Portable Half-Float (16-bits) to Float (32-bits) converter
+static inline float fp16_to_fp32(ggml_fp16_t h) {
+    union { uint32_t u; float f; } o;
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp  = (h & 0x7C00) >> 10;
+    uint32_t mant = (h & 0x03FF) << 13;
+    if (exp == 0x1F) {
+        o.u = sign | 0x7F800000 | mant;
+    } else if (exp == 0) {
+        if (mant == 0) o.u = sign;
+        else {
+            while (!(mant & 0x00800000)) { mant <<= 1; exp--; }
+            o.u = sign | ((exp + 113) << 23) | (mant & 0x007FFFFF);
+        }
+    } else {
+        o.u = sign | ((exp + 112) << 23) | mant;
+    }
+    return o.f;
+}
+
+// Q8_0 physical structure (34 bytes)
+#define QK8_0 32
+struct block_q8_0 {
+    ggml_fp16_t d;
+    int8_t qs[QK8_0];
+};
+
+// Q4_K physical structure (144 bytes)
+#define QK_K 256
+#define K_SCALE_SIZE 12
+struct block_q4_K {
+    ggml_fp16_t d;
+    ggml_fp16_t dmin;
+    uint8_t scales[K_SCALE_SIZE];
+    uint8_t qs[QK_K / 2];
+};
+
+// Q6_K physical structure (210 bytes)
+struct block_q6_K {
+    uint8_t ql[QK_K / 2];      // 128 bytes (lower 4 bits)
+    uint8_t qh[QK_K / 4];      // 64 bytes  (upper 2 bits)
+    int8_t  scales[QK_K / 16]; // 16 bytes  (sub-block scales)
+    ggml_fp16_t d;             // 2 bytes   (super-block scale)
+};
+
+// Intermediate Q8_K: used to quantize activations before dot-product.
+// 4 + 256 + 32 = 292 bytes per 256-element block.
+struct block_q8_K {
+    float   d;
+    int8_t  qs[QK_K];
+    int16_t bsums[QK_K / 16];
+};
+static_assert(sizeof(block_q8_K) == 292, "block_q8_K must be 292 bytes");
+
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static inline void decode_q4k_scales_mins(const uint8_t* q, uint8_t* sc, uint8_t* mn) {
+    sc[0] = q[0] & 63;
+    sc[1] = q[1] & 63;
+    sc[2] = q[2] & 63;
+    sc[3] = q[3] & 63;
+
+    mn[0] = q[4] & 63;
+    mn[1] = q[5] & 63;
+    mn[2] = q[6] & 63;
+    mn[3] = q[7] & 63;
+
+    sc[4] = (q[8]  & 0x0F) | ((q[0] >> 6) << 4);
+    sc[5] = (q[9]  & 0x0F) | ((q[1] >> 6) << 4);
+    sc[6] = (q[10] & 0x0F) | ((q[2] >> 6) << 4);
+    sc[7] = (q[11] & 0x0F) | ((q[3] >> 6) << 4);
+
+    mn[4] = (q[8]  >> 4) | ((q[4] >> 6) << 4);
+    mn[5] = (q[9]  >> 4) | ((q[5] >> 6) << 4);
+    mn[6] = (q[10] >> 4) | ((q[6] >> 6) << 4);
+    mn[7] = (q[11] >> 4) | ((q[7] >> 6) << 4);
+}
+
+// ============================================================================
+// NEURAL NETWORK OPERATORS
+// ============================================================================
+
+// Base Structure for a Network Tensor
 struct Tensor {
     std::string name;
     std::string type_str;
