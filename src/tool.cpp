@@ -1,5 +1,4 @@
 #include "tool.h"
-#include <ctime>
 
 namespace {
 // Remove wrapper CDATA, se presente, do valor de um <param>.
@@ -65,25 +64,3 @@ std::vector<std::string> ToolRegistry::definitions() const {
     return out;
 }
 
-std::string GetDateTimeTool::name() const {
-    return "get_datetime";
-}
-
-std::string GetDateTimeTool::execute(const std::vector<std::pair<std::string, std::string>>& args) const {
-    (void)args; // get_datetime nao tem parametros obrigatorios
-    std::time_t now = std::time(nullptr);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    localtime_s(&tm_buf, &now);
-#else
-    localtime_r(&now, &tm_buf);
-#endif
-    char buf[64];
-    std::strftime(buf, sizeof buf, "%A, %Y-%m-%d %H:%M:%S", &tm_buf);
-    return std::string(buf);
-}
-
-std::string GetDateTimeTool::definition() const {
-    return "{\"name\": \"get_datetime\", \"description\": \"Get the current date and time.\", "
-           "\"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}";
-}

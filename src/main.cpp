@@ -3,6 +3,22 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool.h"
+
+// Para adicionar tools, inclua tool_function.h e registre no registry:
+//
+//   #include "tool_function.h"
+//   #include "tool_examples/examples.h"  // exemplos prontos (datetime, math)
+//
+//   ToolRegistry registry;
+//   register_example_tools(registry);    // registra datetime + add/multiply/sqrt
+//
+// Ou registre suas proprias funcoes diretamente:
+//
+//   #include "tool_function.h"
+//   ToolRegistry registry;
+//   registry.add_function("minha_tool", "Descricao", [](int x) { return x * 2; },
+//       { TOOL_ARG(x, "Valor de entrada") });
+//
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -209,8 +225,8 @@ int main(int argc, char** argv) {
     opts.enable_thinking = enable_think;
     // Tools: instancia no registry. Nova tool = subclasse de Tool + registry.add<T>().
     // O renderer injeta as definicoes (registry.definitions()) no system prompt.
+    // Veja o bloco de comentario no topo deste arquivo para exemplos de como adicionar.
     ToolRegistry registry;
-    registry.add<GetDateTimeTool>();
     std::vector<std::string> tool_defs = registry.definitions();
     opts.tools_json = tool_defs;
     chat_template::Renderer renderer("<s>");

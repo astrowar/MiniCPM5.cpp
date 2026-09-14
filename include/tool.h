@@ -91,11 +91,3 @@ private:
 // e extrai name + pares <param name="k">v</param>. Retorna name vazio se nenhum
 // <function> for encontrado (=> resposta final, nao tool call).
 ParsedCall parse_tool_call(const std::string& text);
-
-// Tool concreta: data/hora local atual (sem parametros obrigatorios).
-class GetDateTimeTool : public Tool {
-public:
-    std::string name() const override;
-    std::string execute(const std::vector<std::pair<std::string, std::string>>& args) const override;
-    std::string definition() const override;
-};
