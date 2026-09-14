@@ -9,7 +9,7 @@ Built with **zero third-party dependencies** (no PyTorch, Hugging Face, or Pytho
 ## 🆕 What's New
 
 * **v1.3.0** (Latest) — **FunctionTool**: register any C++ function or lambda as a tool via `function_traits` (compile-time type deduction, auto-generated JSON schemas). Opt-in `tool_examples/` module with demo tools.
-* **v1.2.0** — Improved AVX2 decode kernels (Q4_K/Q6_K/Q8_K path), optimized Q4 metadata decode, fused Gate+Up hot path cleanup, and portable OpenMP thread-affinity tuning via runtime settings (`OMP_PLACES`/`OMP_PROC_BIND`) for Windows/Linux builds.
+* **v1.2.0** — Improved AVX2 decode kernels (Q4_K/Q6_K/Q8_K path), optimized Q4 metadata decode, fused Gate+Up hot path, and CMake build options for AVX2/NEON/OpenMP.
 * **v1.0.0** — Initial release: full GGUF parser, Q4_K/Q6_K/Q8_0 dequantization, GQA with KV cache, RoPE embeddings, SwiGLU activations, temperature + top-p sampling, and an interactive CLI with `</think>` reasoning tag support.
 
 ---
@@ -46,6 +46,11 @@ MiniCPM5.cpp/
 ├── tool_examples/
 │   ├── examples.h              # register_example_tools() — opt-in demo tools
 │   └── examples.cpp            # get_datetime, add, multiply, sqrt (lambdas)
+├── tools/
+│   └── generate_header.py      # Regenerates minicpm_metadata.h from GGUF
+├── tests/
+│   ├── chat_template/          # Jinja template validation (12/12 tests)
+│   └── tool_function/          # FunctionTool unit tests
 └── src/
     ├── main.cpp                # CLI + generation / agentic (tool-calling) loop
     ├── model.cpp               # Engine forward pass + GGUF tensor loading
@@ -97,39 +102,31 @@ cmake --build build --config Release -- /m
 
 The binary will be at `build\Release\minicpm_engine.exe`.
 
-### OpenMP Affinity Tuning (Optional)
-
-For optimal decode stability and performance, configure OpenMP environment variables. Example for 8 physical cores:
-
-**Linux/macOS:**
-```bash
-export OMP_NUM_THREADS=8
-export OMP_DYNAMIC=false
-export OMP_PLACES=cores
-export OMP_PROC_BIND=close
-export OMP_WAIT_POLICY=ACTIVE
-```
-
-**Windows (PowerShell):**
-```powershell
-$env:OMP_NUM_THREADS=8
-$env:OMP_DYNAMIC="false"
-$env:OMP_PLACES="cores"
-$env:OMP_PROC_BIND="close"
-$env:OMP_WAIT_POLICY="ACTIVE"
-```
-
 ---
 
 ## 🚀 How to Run
 
 ### Getting the Model
 
-Download a quantized GGUF model file. Recommended options:
-- **Q4_K_M** (smaller, faster): `MiniCPM5-2B-Q4_K_M.gguf` (~1.6GB)
-- **Q6_K_M** (balanced): `MiniCPM5-2B-Q6_K_M.gguf` (~2.0GB)
+Download the **Q4_K_M** quantization from the official HuggingFace repository:
+
+> **[openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF)** — file: `MiniCPM5-2B-Q4_K_M.gguf` (~1.5 GB)
 
 Place the model file in your working directory or specify its path with `-m`.
+
+### Regenerating `minicpm_metadata.h`
+
+The header file `include/minicpm_metadata.h` (tensor offsets, dimensions, architecture constants) is auto-generated from the GGUF binary. To regenerate it (e.g. after switching quantization):
+
+```bash
+# Requires: Python 3 + numpy + gguf-py (from llama.cpp)
+# The script auto-detects gguf-py in ../llama.cpp/gguf-py/
+python3 tools/generate_header.py /path/to/MiniCPM5-2B-Q4_K_M.gguf
+```
+
+**Prerequisites for the script:**
+- Python 3.8+ with `numpy` installed
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) cloned as a sibling directory (`../llama.cpp`) — provides the `gguf-py` parser module
 
 ### CLI Usage
 
@@ -181,7 +178,7 @@ Linking OpenMP parallelization achieves nearly linear speedup scaling across CPU
 | **2 Threads**               | ~0.97 tok/s            |
 | **4 Threads**               | **~1.76 tok/s**        |
 
-For detailed architectural information on ARM compilation, read [ARM_NEON.md](ARM_NEON.md). For broader scalar fallback details, check the internal documentation.
+NEON kernels are auto-enabled when CMake detects an ARM architecture (`aarch64`, `armv7`). The CMake build system selects the appropriate SIMD source file (`ops_avx2.cpp` for x86, `ops_neon.cpp` for ARM, or scalar-only fallback).
 
 ---
 
@@ -312,7 +309,7 @@ The result of 15 + 27 is 42.
 
 ## ⚠️ Limitations
 
-* **Model support:** Currently only tested with **MiniCPM5 (2.4B parameters)** in Q4_K_M and Q6_K_M GGUF formats. Other model architectures or quantization types may not work.
+* **Model support:** Currently tested with **MiniCPM5-2B** in **Q4_K_M** GGUF format (from [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF)). Other architectures or quantizations may work but are untested.
 * **Single batch size:** The engine runs with `batch_size = 1`, optimized for autoregressive decoding (one token at a time).
 * **CPU only:** No GPU acceleration. Performance depends entirely on CPU memory bandwidth and core count.
 * **Limited quantization formats:** Only Q4_K, Q6_K, and Q8_0 formats are supported.
